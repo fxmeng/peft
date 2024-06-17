@@ -632,7 +632,9 @@ class Embedding(nn.Module, LoraLayer):
         else:
             self.scaling[adapter_name] = lora_alpha / r
 
-        if init_lora_weights == "loftq":
+        if isinstance(init_lora_weights, str) and init_lora_weights.startswith("pissa"):
+            self.pissa_init(adapter_name, init_lora_weights)
+        elif init_lora_weights == "loftq":
             self.loftq_init(adapter_name)
         elif init_lora_weights:
             self.reset_lora_parameters(adapter_name, init_lora_weights)
@@ -644,7 +646,44 @@ class Embedding(nn.Module, LoraLayer):
             self.to(base_layer.weight.device, dtype=weight.dtype)
 
         self.set_adapter(self.active_adapters)
+        
+    def pissa_init(self, adapter_name, init_lora_weights):
+        weight = self.get_base_layer().weight
+        print(weight.shape)
+        print(self.lora_embedding_A[adapter_name].data.shape,self.lora_embedding_B[adapter_name].data.shape)
+        dtype = weight.dtype
+        if dtype not in [torch.float32, torch.float16, torch.bfloat16]:
+            raise TypeError(
+                "Please initialize PiSSA under float32, float16, or bfloat16. "
+                "Subsequently, re-quantize the residual model to help minimize quantization errors."
+            )
+        weight = weight.to(torch.float32)
+        if init_lora_weights == "pissa":
+            U, S, Vh = torch.linalg.svd(weight.data, full_matrices=False)
+            Ur = U[:, : self.r[adapter_name]]
+            Sr = S[: self.r[adapter_name]]
+            Sr /= self.scaling[adapter_name]
+            Vhr = Vh[: self.r[adapter_name]]
+        elif len(init_lora_weights.split("_niter_")) == 2:
+            Ur, Sr, Vr = svd_lowrank(
+                weight.data, self.r[adapter_name], niter=int(init_lora_weights.split("_niter_")[-1])
+            )
+            Sr /= self.scaling[adapter_name]
+            Vhr = Vr.t()
+        else:
+            raise ValueError(
+                f"init_lora_weights should be 'pissa' or 'pissa_niter_[number of iters]', got {init_lora_weights} instead."
+            )
 
+        lora_embedding_A = Ur @ torch.diag(torch.sqrt(Sr))
+        lora_embedding_B = torch.diag(torch.sqrt(Sr)) @ Vhr
+        print(lora_embedding_A.shape, lora_embedding_B.shape)
+        self.lora_embedding_A[adapter_name].data = lora_embedding_A.T
+        self.lora_embedding_B[adapter_name].data = lora_embedding_B.T
+        weight = weight.data - self.scaling[adapter_name] * lora_embedding_A @ lora_embedding_B
+        weight = weight.to(dtype)
+        self.get_base_layer().weight.data = weight
+        
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
         """
         Merge the active adapter weights into the base weights
@@ -855,7 +894,9 @@ class Conv2d(nn.Module, LoraLayer):
         else:
             self.scaling[adapter_name] = lora_alpha / r
 
-        if init_lora_weights == "loftq":
+        if isinstance(init_lora_weights, str) and init_lora_weights.startswith("pissa"):
+            self.pissa_init(adapter_name, init_lora_weights)
+        elif init_lora_weights == "loftq":
             self.loftq_init(adapter_name)
         elif init_lora_weights:
             self.reset_lora_parameters(adapter_name, init_lora_weights)
@@ -872,7 +913,43 @@ class Conv2d(nn.Module, LoraLayer):
             self.use_dora[adapter_name] = False
 
         self.set_adapter(self.active_adapters)
-
+        
+    def pissa_init(self, adapter_name, init_lora_weights):
+        weight = self.get_base_layer().weight.data
+        n,c,h,w = weight.shape
+        dtype = weight.dtype
+        weight = weight.view(n,c*h*w)
+        if dtype not in [torch.float32, torch.float16, torch.bfloat16]:
+            raise TypeError(
+                "Please initialize PiSSA under float32, float16, or bfloat16. "
+                "Subsequently, re-quantize the residual model to help minimize quantization errors."
+            )
+        weight = weight.to(torch.float32)
+        if init_lora_weights == "pissa":
+            # USV^T = W <-> VSU^T = W^T, where W^T = weight in R^{out_channel, in_channel},
+            V, S, Uh = torch.linalg.svd(weight, full_matrices=False)
+            Vr = V[:, : self.r[adapter_name]]
+            Sr = S[: self.r[adapter_name]]
+            Sr /= self.scaling[adapter_name]
+            Uhr = Uh[: self.r[adapter_name]]
+        elif len(init_lora_weights.split("_niter_")) == 2:
+            Vr, Sr, Ur = svd_lowrank(
+                weight, self.r[adapter_name], niter=int(init_lora_weights.split("_niter_")[-1])
+            )
+            Sr /= self.scaling[adapter_name]
+            Uhr = Ur.t()
+        else:
+            raise ValueError(
+                f"init_lora_weights should be 'pissa' or 'pissa_niter_[number of iters]', got {init_lora_weights} instead."
+            )
+        lora_A = torch.diag(torch.sqrt(Sr)) @ Uhr
+        lora_B = Vr @ torch.diag(torch.sqrt(Sr))    
+        self.lora_A[adapter_name].weight.data = lora_A.view(self.r[adapter_name],c,h,w)
+        self.lora_B[adapter_name].weight.data = lora_B[:,:,None,None]  
+        weight = weight - self.scaling[adapter_name] * lora_B @ lora_A
+        weight = weight.to(dtype)
+        self.get_base_layer().weight.data = weight.view(n,c,h,w)
+        
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
         """
         Merge the active adapter weights inside the base weights
