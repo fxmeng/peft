@@ -24,6 +24,7 @@ import pytest
 import torch
 import yaml
 from diffusers import StableDiffusionPipeline
+from packaging import version
 
 from peft import (
     AdaLoraConfig,
@@ -464,13 +465,16 @@ class PeftCommonTester:
         if ("gpt2" in model_id.lower()) and (config_cls != LoraConfig):
             self.skipTest("Merging GPT2 adapters not supported for IA³ (yet)")
 
+        if (self.torch_device in ["cpu"]) and (version.parse(torch.__version__) <= version.parse("2.1")):
+            self.skipTest("PyTorch 2.1 not supported for Half of addmm_impl_cpu_ ")
+
         model = self.transformers_class.from_pretrained(model_id, torch_dtype=torch.float16)
         config = config_cls(
             base_model_name_or_path=model_id,
             **config_kwargs,
         )
         model = get_peft_model(model, config)
-        model = model.to(device="cpu", dtype=torch.float16)
+        model = model.to(device=self.torch_device, dtype=torch.float16)
 
         model.eval()
 
@@ -561,6 +565,11 @@ class PeftCommonTester:
         logits_merged_unloaded = model(**dummy_input)[0]
 
         atol, rtol = 1e-4, 1e-4
+        if self.torch_device in ["mlu"]:
+            atol, rtol = 1e-3, 1e-3  # MLU
+        if config.peft_type == "ADALORA":
+            # AdaLoRA is a bit flaky on CI, but this cannot be reproduced locally
+            atol, rtol = 1e-2, 1e-2
         if (config.peft_type == "IA3") and (model_id == "Conv2d"):
             # for some reason, the IA³ Conv2d introduces a larger error
             atol, rtol = 0.3, 0.01
@@ -689,16 +698,19 @@ class PeftCommonTester:
         model = get_peft_model(model, config).eval()
         logits_peft = model(**inputs)[0]
 
+        atol, rtol = 1e-6, 1e-6  # default
         # Initializing with LN tuning cannot be configured to change the outputs (unlike init_lora_weights=False)
         if not issubclass(config_cls, LNTuningConfig):
             # sanity check that the logits are different
-            assert not torch.allclose(logits_base, logits_peft, atol=1e-6, rtol=1e-6)
+            assert not torch.allclose(logits_base, logits_peft, atol=atol, rtol=rtol)
 
         model_unloaded = model.merge_and_unload(safe_merge=True)
         logits_unloaded = model_unloaded(**inputs)[0]
 
+        if self.torch_device in ["mlu"]:
+            atol, rtol = 1e-3, 1e-3  # MLU
         # check that the logits are the same after unloading
-        assert torch.allclose(logits_peft, logits_unloaded, atol=1e-6, rtol=1e-6)
+        assert torch.allclose(logits_peft, logits_unloaded, atol=atol, rtol=rtol)
 
     def _test_mixed_adapter_batches(self, model_id, config_cls, config_kwargs):
         # Test for mixing different adapters in a single batch by passing the adapter_names argument
@@ -1139,22 +1151,7 @@ class PeftCommonTester:
             assert not torch.allclose(logits_with_adapter, logits_unload, atol=1e-10, rtol=1e-10)
             assert torch.allclose(logits_transformers, logits_unload, atol=1e-4, rtol=1e-4)
 
-    def _test_weighted_combination_of_adapters(self, model_id, config_cls, config_kwargs):
-        if issubclass(config_cls, AdaLoraConfig):
-            # AdaLora does not support adding more than 1 adapter
-            return pytest.skip(f"Test not applicable for {config_cls}")
-
-        adapter_list = ["adapter1", "adapter_2", "adapter_3"]
-        weight_list = [0.5, 1.5, 1.5]
-        config = config_cls(
-            base_model_name_or_path=model_id,
-            **config_kwargs,
-        )
-        if not isinstance(config, LoraConfig):
-            return pytest.skip(f"Test not applicable for {config}")
-
-        model = self.transformers_class.from_pretrained(model_id)
-        model = get_peft_model(model, config, adapter_list[0])
+    def _test_weighted_combination_of_adapters_lora(self, model, config, adapter_list, weight_list):
         model.add_adapter(adapter_list[1], config)
         model.add_adapter(adapter_list[2], replace(config, r=20))
         model = model.to(self.torch_device)
@@ -1337,6 +1334,60 @@ class PeftCommonTester:
             assert model.active_adapter == adapter_name
             assert model.active_adapters == [adapter_name]
             model(**dummy_input)[0]
+
+    def _test_weighted_combination_of_adapters_ia3(self, model, config, adapter_list, weight_list):
+        model.add_adapter(adapter_list[1], config)
+        model.add_adapter(adapter_list[2], config)
+        model = model.to(self.torch_device)
+
+        # test re-weighting single adapter
+        model.add_weighted_adapter([adapter_list[0]], [weight_list[0]], "single_adapter_reweighting")
+
+        # test re-weighting with multiple adapters
+        model.add_weighted_adapter(adapter_list[1:], weight_list[1:], "multi_adapter_reweighting")
+
+        new_adapters = [
+            "single_adapter_reweighting",
+            "multi_adapter_reweighting",
+        ]
+        for new_adapter in new_adapters:
+            assert new_adapter in model.peft_config
+
+        dummy_input = self.prepare_inputs_for_testing()
+        model.eval()
+        for adapter_name in new_adapters:
+            # ensuring new adapters pass the forward loop
+            model.set_adapter(adapter_name)
+            assert model.active_adapter == adapter_name
+            assert model.active_adapters == [adapter_name]
+            model(**dummy_input)[0]
+
+    def _test_weighted_combination_of_adapters(self, model_id, config_cls, config_kwargs):
+        if issubclass(config_cls, AdaLoraConfig):
+            # AdaLora does not support adding more than 1 adapter
+            return pytest.skip(f"Test not applicable for {config_cls}")
+
+        adapter_list = ["adapter1", "adapter_2", "adapter_3"]
+        weight_list = [0.5, 1.5, 1.5]
+        # Initialize the config
+        config = config_cls(
+            base_model_name_or_path=model_id,
+            **config_kwargs,
+        )
+
+        if not isinstance(config, (LoraConfig, IA3Config)):
+            # This test is only applicable for Lora and IA3 configs
+            return pytest.skip(f"Test not applicable for {config}")
+
+        model = self.transformers_class.from_pretrained(model_id)
+        model = get_peft_model(model, config, adapter_list[0])
+
+        if isinstance(config, LoraConfig):
+            self._test_weighted_combination_of_adapters_lora(model, config, adapter_list, weight_list)
+        elif isinstance(config, IA3Config):
+            self._test_weighted_combination_of_adapters_ia3(model, config, adapter_list, weight_list)
+        else:
+            pytest.skip(f"Test not applicable for {config}")
 
     def _test_disable_adapter(self, model_id, config_cls, config_kwargs):
         task_type = config_kwargs.get("task_type")

@@ -71,6 +71,8 @@ def get_peft_model_state_dict(
     config = model.peft_config[adapter_name]
     if state_dict is None:
         state_dict = model.state_dict()
+
+    # TUNER SPECIFIC CODE
     if config.peft_type in (PeftType.LORA, PeftType.ADALORA):
         # to_return = lora_state_dict(model, bias=model.peft_config.bias)
         # adapted from `https://github.com/microsoft/LoRA/blob/main/loralib/utils.py`
@@ -97,6 +99,37 @@ def get_peft_model_state_dict(
                 rank_pattern = {k.replace(f".{adapter_name}", ""): v for k, v in rank_pattern.items()}
                 config.rank_pattern = rank_pattern
                 to_return = model.resize_state_dict_by_rank_pattern(rank_pattern, to_return, adapter_name)
+
+        if config.use_dora:
+            # Here we take care of a refactor of DoRA which changed lora_magnitude_vector from a ParameterDict to a
+            # ModuleDict with a DoraLayer instance. The old parameter is now the "weight" attribute of that layer. Since
+            # we want the state_dict format not to change, we remove the "weight" part.
+            new_dora_suffix = f"lora_magnitude_vector.{adapter_name}.weight"
+
+            def renamed_dora_weights(k):
+                if k.endswith(new_dora_suffix):
+                    k = k[:-7]  # remove ".weight"
+                return k
+
+            to_return = {renamed_dora_weights(k): v for k, v in to_return.items()}
+            
+    if config.peft_type == PeftType.PiSSA:
+        bias = config.bias
+        if bias == "none":
+            to_return = {k: state_dict[k] for k in state_dict if "pissa_" in k}
+        elif bias == "all":
+            to_return = {k: state_dict[k] for k in state_dict if "pissa_" in k or "bias" in k}
+        elif bias == "pissa_only":
+            to_return = {}
+            for k in state_dict:
+                if "pissa_" in k:
+                    to_return[k] = state_dict[k]
+                    bias_name = k.split("pissa_")[0] + "bias"
+                    if bias_name in state_dict:
+                        to_return[bias_name] = state_dict[bias_name]
+        else:
+            raise NotImplementedError
+        to_return = {k: v for k, v in to_return.items() if (("pissa_" in k and adapter_name in k) or ("bias" in k))}
 
     elif config.peft_type == PeftType.BOFT:
         bias = config.bias
@@ -165,11 +198,13 @@ def get_peft_model_state_dict(
     else:
         raise ValueError(f"Unknown PEFT type passed: {config.peft_type}")
 
+    # MODULES TO SAVE
     if getattr(model, "modules_to_save", None) is not None:
         for key, value in state_dict.items():
             if any(f"{module_name}.modules_to_save.{adapter_name}" in key for module_name in model.modules_to_save):
                 to_return[key.replace("modules_to_save.", "")] = value
 
+    # DEAL WITH EMBEDDINGS
     # check the common embedding layers in `target_modules` to reset `save_embedding_layers` if necessary
     is_embedding_in_target_modules = False
     if (
@@ -185,25 +220,26 @@ def get_peft_model_state_dict(
 
         # For some models e.g. diffusers the text config file is stored in a subfolder
         # we need to make sure we can download that config.
-        has_remote_config = False
+        has_base_config = False
 
         # ensure that this check is not performed in HF offline mode, see #1452
         if model_id is not None:
-            exists = check_file_exists_on_hf_hub(model_id, "config.json")
+            local_config_exists = os.path.exists(os.path.join(model_id, "config.json"))
+            exists = local_config_exists or check_file_exists_on_hf_hub(model_id, "config.json")
             if exists is None:
                 # check failed, could not determine if it exists or not
                 warnings.warn(
                     f"Could not find a config file in {model_id} - will assume that the vocabulary was not modified."
                 )
-                has_remote_config = False
+                has_base_config = False
             else:
-                has_remote_config = exists
+                has_base_config = exists
 
         # check if the vocab size of the base model is different from the vocab size of the finetuned model
         if (
             vocab_size
             and model_id
-            and has_remote_config
+            and has_base_config
             and (vocab_size != model.config.__class__.from_pretrained(model_id).vocab_size)
         ):
             warnings.warn(
@@ -223,6 +259,7 @@ def get_peft_model_state_dict(
     elif save_embedding_layers:
         warnings.warn("Could not identify embedding layer(s) because the model is not a 🤗 transformers model.")
 
+    # REMOVE ADAPTER NAME
     to_return = {k.replace(f".{adapter_name}", ""): v for k, v in to_return.items()}
     return to_return
 
@@ -286,6 +323,7 @@ def set_peft_model_state_dict(
 
     if config.peft_type in (
         PeftType.LORA,
+        PeftType.PiSSA,
         PeftType.LOHA,
         PeftType.LOKR,
         PeftType.ADALORA,
@@ -300,6 +338,7 @@ def set_peft_model_state_dict(
         parameter_prefix = {
             PeftType.IA3: "ia3_",
             PeftType.LORA: "lora_",
+            PeftType.PiSSA: "pissa_",
             PeftType.ADALORA: "lora_",
             PeftType.LOHA: "hada_",
             PeftType.LOKR: "lokr_",
@@ -342,6 +381,18 @@ def set_peft_model_state_dict(
                     " PRNG initialisation to restore these projections using `config.projection_prng_key`, which may"
                     " not be accurate on all system configurations."
                 )
+        elif config.peft_type == PeftType.LORA:
+            # Here we take care of a refactor of DoRA which changed lora_magnitude_vector from a ParameterDict to a
+            # ModuleDict with a DoraLayer instance. The old parameter is now the "weight" attribute of that layer.
+            old_dora_suffix = f"lora_magnitude_vector.{adapter_name}"
+
+            def renamed_dora_weights(k):
+                if k.endswith(old_dora_suffix):
+                    k = k + ".weight"
+                return k
+
+            peft_model_state_dict = {renamed_dora_weights(k): v for k, v in peft_model_state_dict.items()}
+
     elif config.is_prompt_learning or config.peft_type == PeftType.ADAPTION_PROMPT:
         peft_model_state_dict = state_dict
     else:

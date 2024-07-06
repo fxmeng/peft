@@ -20,12 +20,26 @@ import torch
 from scipy import stats
 from torch import nn
 
-from peft import AdaLoraConfig, LoraConfig, PeftModel, PromptTuningConfig, VeraConfig, get_peft_model
+from peft import (
+    AdaLoraConfig,
+    LoraConfig,
+    PeftMixedModel,
+    PeftModel,
+    PeftModelForCausalLM,
+    PeftModelForFeatureExtraction,
+    PeftModelForQuestionAnswering,
+    PeftModelForSeq2SeqLM,
+    PeftModelForSequenceClassification,
+    PeftModelForTokenClassification,
+    PromptTuningConfig,
+    VeraConfig,
+    get_peft_model,
+)
 from peft.utils import infer_device
 
 
 class TestLoraInitialization:
-    """Test class to check the initialization of adapters."""
+    """Test class to check the initialization of LoRA adapters."""
 
     torch_device = infer_device()
 
@@ -266,6 +280,15 @@ class TestLoraInitialization:
         peft_model = get_peft_model(deepcopy(model), config)
         assert torch.allclose(output, peft_model(data)[0], atol=1e-06)
 
+    def test_lora_olora_linear_init_default(self, data):
+        model = self.get_model()
+        output = model(data)[0]
+
+        # Both OLoRA and olora should work
+        config = LoraConfig(init_lora_weights="OLoRA", target_modules=["linear"])
+        peft_model = get_peft_model(deepcopy(model), config)
+        assert torch.allclose(output, peft_model(data)[0], atol=1e-06)
+
     def test_lora_pissa_conversion_same_output_after_loading(self, data, tmp_path):
         model = self.get_model()
         output_base = model(data)[0]
@@ -300,11 +323,98 @@ class TestLoraInitialization:
         )
 
         # save the model with conversion
+        peft_model.save_pretrained(
+            tmp_path / "pissa-model-converted", path_initial_model_for_weight_conversion=tmp_path / "init-model"
+        )
+        model_converted = PeftModel.from_pretrained(deepcopy(model), tmp_path / "pissa-model-converted")
+        output_converted = model_converted(data)[0]
+
+        assert torch.allclose(output_pissa, output_converted, atol=tol, rtol=tol)
+        # rank should be double of what it was initially
+        assert model_converted.peft_config["default"].r == 16
+        assert model_converted.base_model.model.linear.lora_A["default"].weight.shape[0] == 16
+        # base model weights should be the same as the initial model
+        assert torch.allclose(
+            model.linear.weight, model_converted.base_model.model.linear.base_layer.weight, atol=tol, rtol=tol
+        )
+
+    # TODO: remove test for deprecated arg in PEFT v0.14.0
+    def test_lora_pissa_conversion_same_output_after_loading_with_deprecated_arg(self, data, tmp_path):
+        model = self.get_model()
+        config = LoraConfig(init_lora_weights="pissa", target_modules=["linear"], r=8)
+        peft_model = get_peft_model(deepcopy(model), config)
+        peft_model.peft_config["default"].init_lora_weights = True
+        peft_model.save_pretrained(tmp_path / "init-model")
+        peft_model.peft_config["default"].init_lora_weights = "pissa"
+
+        tol = 1e-06
+        peft_model.base_model.linear.lora_B["default"].weight.data *= 2.0
+        output_pissa = peft_model(data)[0]
+
         peft_model.save_pretrained(tmp_path / "pissa-model-converted", convert_pissa_to_lora=tmp_path / "init-model")
         model_converted = PeftModel.from_pretrained(deepcopy(model), tmp_path / "pissa-model-converted")
         output_converted = model_converted(data)[0]
 
         assert torch.allclose(output_pissa, output_converted, atol=tol, rtol=tol)
+        assert model_converted.peft_config["default"].r == 16
+        assert model_converted.base_model.model.linear.lora_A["default"].weight.shape[0] == 16
+        assert torch.allclose(
+            model.linear.weight, model_converted.base_model.model.linear.base_layer.weight, atol=tol, rtol=tol
+        )
+
+    # TODO: remove test for deprecated warning in PEFT v0.14.0
+    def test_lora_pissa_conversion_deprecated_warning(self, data, tmp_path):
+        model = self.get_model()
+        config = LoraConfig(init_lora_weights="pissa", target_modules=["linear"], r=8)
+        peft_model = get_peft_model(deepcopy(model), config)
+        peft_model.peft_config["default"].init_lora_weights = True
+        peft_model.save_pretrained(tmp_path / "init-model")
+        warning_message = "`convert_pissa_to_lora` is deprecated and will be removed in a future version. Use `path_initial_model_for_weight_conversion` instead."
+        # Test the warning
+        with pytest.warns(UserWarning, match=warning_message):
+            peft_model.save_pretrained(
+                tmp_path / "pissa-model-converted", convert_pissa_to_lora=tmp_path / "init-model"
+            )
+
+    def test_olora_conversion_same_output_after_loading(self, data, tmp_path):
+        model = self.get_model()
+        output_base = model(data)[0]
+
+        config = LoraConfig(init_lora_weights="olora", target_modules=["linear"], r=8)
+        peft_model = get_peft_model(deepcopy(model), config)
+        # save the initial model
+        peft_model.save_pretrained(tmp_path / "init-model")
+
+        # modify the weights, or else the adapter performs an identity transformation
+        peft_model.base_model.linear.lora_B["default"].weight.data *= 2.0
+        output_olora = peft_model(data)[0]
+
+        # sanity check
+        tol = 1e-06
+        assert not torch.allclose(output_base, output_olora, atol=tol, rtol=tol)
+
+        # save the model normally
+        peft_model.save_pretrained(tmp_path / "olora-model")
+        model_loaded = PeftModel.from_pretrained(deepcopy(model), tmp_path / "olora-model")
+        output_loaded = model_loaded(data)[0]
+
+        assert torch.allclose(output_olora, output_loaded, atol=tol, rtol=tol)
+        # sanity check: ranks should still be 8 as initially
+        assert model_loaded.peft_config["default"].r == 8
+        assert model_loaded.base_model.model.linear.lora_A["default"].weight.shape[0] == 8
+        # sanity check: the base model weights were indeed changed
+        assert not torch.allclose(
+            model.linear.weight, model_loaded.base_model.model.linear.base_layer.weight, atol=tol, rtol=tol
+        )
+
+        # save the model with conversion
+        peft_model.save_pretrained(
+            tmp_path / "olora-model-converted", path_initial_model_for_weight_conversion=tmp_path / "init-model"
+        )
+        model_converted = PeftModel.from_pretrained(deepcopy(model), tmp_path / "olora-model-converted")
+        output_converted = model_converted(data)[0]
+
+        assert torch.allclose(output_olora, output_converted, atol=tol, rtol=tol)
         # rank should be double of what it was initially
         assert model_converted.peft_config["default"].r == 16
         assert model_converted.base_model.model.linear.lora_A["default"].weight.shape[0] == 16
@@ -424,6 +534,8 @@ class TestLoraInitialization:
 
 
 class TestAdaLoraInitialization:
+    torch_device = infer_device()
+
     def test_adalora_target_modules_set(self):
         config = AdaLoraConfig(target_modules=["linear", "embed", "conv2d"])
         assert config.target_modules == {"linear", "embed", "conv2d"}
@@ -435,6 +547,33 @@ class TestAdaLoraInitialization:
     def test_adalora_loftq_config_raises(self):
         with pytest.raises(ValueError, match="ADALORA does not support LOFTQ"):
             AdaLoraConfig(loftq_config={"loftq": "config"})
+
+    def get_model(self):
+        class MyModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # choose a large weight so that averages are close to expected values
+                self.linear = nn.Linear(1000, 1000)
+
+            def forward(self, x):
+                return self.linear(x)
+
+        return MyModule().eval().to(self.torch_device)
+
+    @pytest.fixture
+    def data(self):
+        return torch.rand(10, 1000).to(self.torch_device)
+
+    def test_adalora_default_init_identity(self, data):
+        # default is True
+        torch.manual_seed(0)
+
+        model = self.get_model()
+        output_before = model(data)
+        config = AdaLoraConfig(target_modules=["linear"])
+        model = get_peft_model(model, config)
+        output_after = model(data)
+        assert torch.allclose(output_before, output_after)
 
 
 class TestPromptTuningInitialization:
@@ -476,3 +615,55 @@ class TestPromptTuningInitialization:
         )
         with pytest.raises(ValueError, match=msg):
             model.add_adapter("other", config1)
+
+
+class TestNoInfiniteRecursionDeepspeed:
+    # see #1892 for details
+    classes = [
+        PeftModel,
+        PeftMixedModel,
+        PeftModelForSequenceClassification,
+        PeftModelForQuestionAnswering,
+        PeftModelForTokenClassification,
+        PeftModelForCausalLM,
+        PeftModelForSeq2SeqLM,
+        PeftModelForFeatureExtraction,
+    ]
+
+    @pytest.fixture
+    def wrap_init(self):
+        # emulates the wrapper from DeepSpeed
+        import functools
+
+        def decorator(f):
+            @functools.wraps(f)
+            def wrapper(self, *args, **kwargs):
+                hasattr(self, "abc")  # any hasattr will do
+                f(self, *args, **kwargs)
+
+            return wrapper
+
+        return decorator
+
+    @pytest.fixture
+    def model(self):
+        class MyModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(10, 10)
+                # to emulate LMs:
+                self.prepare_inputs_for_generation = None
+                self._prepare_encoder_decoder_kwargs_for_generation = None
+
+        return MyModule()
+
+    @pytest.mark.parametrize("cls", classes)
+    def test_no_infinite_recursion(self, cls, model, wrap_init):
+        original_init = cls.__init__
+        try:
+            cls.__init__ = wrap_init(cls.__init__)
+            # this would trigger an infinite loop before the fix in 1892
+            cls(model, LoraConfig(target_modules=["linear"]))
+        finally:
+            # ensure there are no side effects of this test
+            cls.__init__ = original_init

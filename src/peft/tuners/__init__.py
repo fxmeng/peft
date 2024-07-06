@@ -18,7 +18,8 @@
 # limitations under the License.
 
 from .adaption_prompt import AdaptionPromptConfig, AdaptionPromptModel
-from .lora import LoraConfig, LoraModel, LoftQConfig
+from .lora import LoraConfig, LoraModel, LoftQConfig, LoraRuntimeConfig
+from .pissa import PiSSAConfig, PiSSAModel
 from .loha import LoHaConfig, LoHaModel
 from .lokr import LoKrConfig, LoKrModel
 from .ia3 import IA3Config, IA3Model

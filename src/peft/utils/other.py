@@ -24,6 +24,7 @@ from accelerate.hooks import add_hook_to_module, remove_hook_from_module
 from accelerate.utils import is_npu_available, is_xpu_available
 from huggingface_hub import file_exists
 from huggingface_hub.utils import EntryNotFoundError, HFValidationError
+from packaging import version
 from safetensors.torch import storage_ptr, storage_size
 
 from ..import_utils import is_auto_gptq_available, is_torch_tpu_available
@@ -37,12 +38,20 @@ from .constants import (
     TRANSFORMERS_MODELS_TO_IA3_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_LNTUNING_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING,
+    TRANSFORMERS_MODELS_TO_PiSSA_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING,
     TRANSFORMERS_MODELS_TO_VERA_TARGET_MODULES_MAPPING,
     WEIGHTS_NAME,
     bloom_model_postprocess_past_key_value,
     starcoder_model_postprocess_past_key_value,
 )
+
+
+mlu_available = False
+if version.parse(accelerate.__version__) >= version.parse("0.29.0"):
+    from accelerate.utils import is_mlu_available
+
+    mlu_available = is_mlu_available()
 
 
 __all__ = [
@@ -69,6 +78,8 @@ def infer_device() -> str:
         return "cuda"
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
+    elif mlu_available:
+        return "mlu"
     elif is_xpu_available():
         return "xpu"
     elif is_npu_available():
@@ -98,6 +109,7 @@ def prepare_model_for_kbit_training(model, use_gradient_checkpointing=True, grad
     is_gptq_quantized = getattr(model, "quantization_method", None) == "gptq"
     is_aqlm_quantized = getattr(model, "quantization_method", None) == "aqlm"
     is_eetq_quantized = getattr(model, "quantization_method", None) == "eetq"
+    is_hqq_quantized = getattr(model, "quantization_method", None) == "hqq" or getattr(model, "hqq_quantized", False)
 
     if gradient_checkpointing_kwargs is None:
         gradient_checkpointing_kwargs = {}
@@ -106,7 +118,7 @@ def prepare_model_for_kbit_training(model, use_gradient_checkpointing=True, grad
         # freeze base model's layers
         param.requires_grad = False
 
-    if not is_gptq_quantized and not is_aqlm_quantized and not is_eetq_quantized:
+    if not is_gptq_quantized and not is_aqlm_quantized and not is_eetq_quantized and not is_hqq_quantized:
         # cast all non INT8 parameters to fp32
         for param in model.parameters():
             if (
@@ -114,7 +126,9 @@ def prepare_model_for_kbit_training(model, use_gradient_checkpointing=True, grad
             ) and param.__class__.__name__ != "Params4bit":
                 param.data = param.data.to(torch.float32)
 
-    if (loaded_in_kbit or is_gptq_quantized or is_aqlm_quantized or is_eetq_quantized) and use_gradient_checkpointing:
+    if (
+        loaded_in_kbit or is_gptq_quantized or is_aqlm_quantized or is_eetq_quantized or is_hqq_quantized
+    ) and use_gradient_checkpointing:
         # When having `use_reentrant=False` + gradient_checkpointing, there is no need for this hack
         if "use_reentrant" not in gradient_checkpointing_kwargs or gradient_checkpointing_kwargs["use_reentrant"]:
             # For backward compatibility

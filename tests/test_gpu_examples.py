@@ -16,6 +16,7 @@ import importlib
 import os
 import tempfile
 import unittest
+from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union
@@ -28,6 +29,8 @@ from accelerate.utils import patch_environment
 from datasets import Audio, DatasetDict, load_dataset
 from packaging import version
 from parameterized import parameterized
+from torch.distributed import init_process_group
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForSeq2SeqLM,
@@ -56,6 +59,7 @@ from peft import (
 )
 from peft.utils import SAFETENSORS_WEIGHTS_NAME
 from peft.utils.loftq_utils import NFQuantizer
+from peft.utils.other import fsdp_auto_wrap_policy
 
 from .testing_utils import (
     require_aqlm,
@@ -63,6 +67,7 @@ from .testing_utils import (
     require_auto_gptq,
     require_bitsandbytes,
     require_eetq,
+    require_hqq,
     require_optimum,
     require_torch_gpu,
     require_torch_multi_gpu,
@@ -1094,6 +1099,33 @@ class PeftBnbGPUExampleTests(unittest.TestCase):
             # assert loss is not None
             assert trainer.state.log_history[-1]["train_loss"] is not None
 
+    @parameterized.expand(["4bit", "8bit"])
+    def test_initialize_dora_with_bnb_on_cpu(self, kbit):
+        # 1674
+        # The issue is that to initialize DoRA, we need to dequantize the weights. That only works on GPU for bnb.
+        # Therefore, intializing DoRA with bnb on CPU used to fail.
+        model_id = "facebook/opt-125m"
+        if kbit == "4bit":
+            bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4")
+        elif kbit == "8bit":
+            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+        else:
+            raise ValueError("Only 4bit and 8bit bnb allowed")
+
+        model = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=bnb_config)
+        model = model.cpu()  # ensure that we're on CPU
+        # sanity check that all weights are on CPU
+        weights_not_cpu = [name for name, p in model.named_parameters() if p.device != torch.device("cpu")]
+        assert not weights_not_cpu
+
+        lora_config = LoraConfig(use_dora=True)
+
+        # should not raise
+        peft_model = get_peft_model(model, lora_config)
+        # check that the weights are still on CPU
+        weights_not_cpu = [name for name, p in peft_model.named_parameters() if p.device != torch.device("cpu")]
+        assert not weights_not_cpu
+
 
 @require_torch_gpu
 @require_auto_gptq
@@ -1624,7 +1656,7 @@ class TestPiSSA:
         assert model_loaded.base_model.model.linear.lora_A["default"].weight.shape[0] == 8
 
         # save the model with conversion
-        peft_model.save_pretrained(tmp_path / "pissa-model-converted", convert_pissa_to_lora=tmp_path / "init-model")
+        peft_model.save_pretrained(tmp_path / "pissa-model-converted", convert_mutated_to_lora=tmp_path / "init-model")
         model_converted = PeftModel.from_pretrained(deepcopy(model), tmp_path / "pissa-model-converted")
         output_converted = model_converted(data)[0]
 
@@ -1637,6 +1669,117 @@ class TestPiSSA:
         )
         # This check is expected to fail when using bnb
         assert not torch.allclose(output_finetuned_pissa, output_converted, atol=tol, rtol=tol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="test requires a GPU")
+class TestOLoRA:
+    r"""
+    Tests for OLoRA to ensure that it reduces the quantization error compared to normal LoRA quantization.
+    """
+
+    # The error factor indicates by how much the quantization error should be decreased when using OLoRA compared to
+    # quantization without OLoRA. Thus 1.03 means that the error should be decreased by 3% at least. This is a very
+    # conservative value to prevent flakiness, in practice most gains are > 1.5
+    error_factor = 1.2
+
+    def quantize_model(self, model, num_bits=4, device="cuda"):
+        # Quantize the `weight.data` of the linear layer in the model to `num_bits` and store it with full precision.
+        quantizer = NFQuantizer(num_bits=num_bits, device=device, method="normal", block_size=64)
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Linear) and "lm_head" not in name:
+                quantized_weight, max_abs, shape = quantizer.quantize_block(module.weight.data.to(device))
+                module.weight.data = quantizer.dequantize_block(quantized_weight, max_abs, shape)
+        return model
+
+    def nuclear_norm(self, base_model, quantized_model):
+        # Calculate the nuclear norm (sum of singular values) of the error matrices between the `quantized_model` and the `base_model`.
+        error_list = []
+        for name, module in base_model.named_modules():
+            if isinstance(module, torch.nn.Linear) and "lm_head" not in name:
+                quant_module = quantized_model.get_submodule(name)
+                error_list.append(torch.linalg.svdvals(module.weight.data - quant_module.weight.data).sum())
+        return torch.Tensor(error_list).sum()
+
+    def get_errors(
+        self,
+        tmp_path,
+        bits=4,
+        device="cuda",
+        model_id="hf-internal-testing/tiny-random-BloomForCausalLM",
+    ):
+        # Comparing the quantized LoRA model to the base model, vs the OLoRA quantized model to the base model.
+        # We expect the OLoRA quantized model to have less error than the normal LoRA quantized model.
+
+        cls = AutoModelForSeq2SeqLM if "t5" in str(model_id) else AutoModelForCausalLM
+        base_model = cls.from_pretrained(model_id).eval().to(device)
+        task_type = TaskType.SEQ_2_SEQ_LM if base_model.config.is_encoder_decoder else TaskType.CAUSAL_LM
+
+        # logits from the normal quantized LoRA model
+        target_modules = "all-linear" if task_type != TaskType.SEQ_2_SEQ_LM else ["o", "k", "wi", "q", "v"]
+        lora_config = LoraConfig(task_type=task_type, target_modules=target_modules)
+
+        qlora_model = self.quantize_model(cls.from_pretrained(model_id).eval().to(device), bits, device)
+        qlora_model = get_peft_model(
+            qlora_model,
+            lora_config,
+        )
+        qlora_model = qlora_model.merge_and_unload()
+        qlora_error = self.nuclear_norm(base_model, qlora_model)
+        del qlora_model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # logits from quantized LoRA model using OLoRA
+        lora_config = LoraConfig(
+            task_type=task_type,
+            init_lora_weights="olora",
+            target_modules=target_modules,
+        )
+        olora_model = cls.from_pretrained(model_id).eval().to(device)
+        olora_model = get_peft_model(olora_model, lora_config)
+
+        # save LoRA weights, they should be initialized such that they minimize the quantization error
+        olora_model.base_model.peft_config["default"].init_lora_weights = True
+        olora_model.save_pretrained(tmp_path / "olora_model")
+
+        olora_model = olora_model.unload()
+        olora_model.save_pretrained(tmp_path / "residual_model")
+
+        del olora_model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # now load quantized model and apply OLoRA-initialized weights on top
+        qolora_model = self.quantize_model(
+            cls.from_pretrained(tmp_path / "residual_model").eval().to(device), bits, device
+        )
+        qolora_model = PeftModel.from_pretrained(qolora_model, tmp_path / "olora_model")
+        qolora_model = qolora_model.merge_and_unload()
+        qolora_error = self.nuclear_norm(base_model, qolora_model)
+        del qolora_model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        assert qlora_error > 0.0
+        assert qolora_error > 0.0
+
+        # next, check that OLoRA quantization errors are smaller than LoRA errors by a certain margin
+        assert qolora_error < (qlora_error / self.error_factor)
+
+    @pytest.mark.parametrize("device", ["cuda", "cpu"])
+    def test_bloomz_olora_4bit(self, device, tmp_path):
+        # In this test, we compare the logits of the base model, the quantized LoRA model, and the quantized model
+        # using OLoRA. When quantizing, we expect a certain level of error. However, we expect the OLoRA quantized
+        # model to have less error than the normal LoRA quantized model. Note that when using normal LoRA, the
+        # quantization error is simply the error from quantization without LoRA, as LoRA is a no-op before training.
+        # We still apply LoRA for the test for consistency.
+
+        self.get_errors(bits=4, device=device, tmp_path=tmp_path)
+
+    @pytest.mark.parametrize("device", ["cuda", "cpu"])
+    def test_bloomz_olora_8bit(self, device, tmp_path):
+        # Same test as test_bloomz_olora_4bit but with 8 bits.
+        self.get_errors(bits=8, device=device, tmp_path=tmp_path)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="test requires a GPU")
@@ -1974,7 +2117,7 @@ class MultiprocessTester(unittest.TestCase):
 @require_torch_gpu
 class MixedPrecisionTests(unittest.TestCase):
     def setUp(self):
-        self.causal_lm_model_id = "facebook/opt-350m"
+        self.causal_lm_model_id = "facebook/opt-125m"
         self.tokenizer = AutoTokenizer.from_pretrained(self.causal_lm_model_id)
         self.config = LoraConfig(
             r=16,
@@ -1996,15 +2139,14 @@ class MixedPrecisionTests(unittest.TestCase):
         gc.collect()
 
     @pytest.mark.single_gpu_tests
-    def test_model_loaded_in_float16_raises(self):
-        # This test shows the issue with loading the model in fp16 and then trying to use it with mixed precision
-        # training, which should not use fp16. If this is ever automated in PEFT, this test should fail. In that case,
-        # remove this test, adjust the next one, and remove the entry about FP16 usage from troubleshooting.md.
+    def test_model_using_float16_with_amp_raises(self):
+        # This test shows the issue with using a model in fp16 and then trying to use it with mixed precision training,
+        # which should not use fp16.
         model = AutoModelForCausalLM.from_pretrained(
             self.causal_lm_model_id,
             torch_dtype=torch.float16,
         )
-        model = get_peft_model(model, self.config)
+        model = get_peft_model(model, self.config, autocast_adapter_dtype=False)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             trainer = Trainer(
@@ -2012,8 +2154,8 @@ class MixedPrecisionTests(unittest.TestCase):
                 train_dataset=self.data["train"],
                 args=TrainingArguments(
                     fp16=True,  # <= this is required for the error to be raised
-                    logging_steps=1,
                     output_dir=tmp_dir,
+                    max_steps=3,
                 ),
                 data_collator=DataCollatorForLanguageModeling(self.tokenizer, mlm=False),
             )
@@ -2021,32 +2163,216 @@ class MixedPrecisionTests(unittest.TestCase):
                 trainer.train()
 
     @pytest.mark.single_gpu_tests
-    def test_model_loaded_in_float16_working(self):
-        # Same test as before but containing the fix to make it work
+    def test_model_using_float16_autocast_dtype(self):
+        # Here we use autocast_adapter_dtype=True (the default) to automatically promote the adapter weights to float32.
+        # No exception should be raised.
         model = AutoModelForCausalLM.from_pretrained(
             self.causal_lm_model_id,
             torch_dtype=torch.float16,
         )
-        model = get_peft_model(model, self.config)
-
-        # for now, this is unfortunately necessary to avoid the error:
-        # ValueError: Attempting to unscale FP16 gradients.
-        for param in model.parameters():
-            if param.requires_grad:
-                param.data = param.data.float()
+        model = get_peft_model(model, self.config, autocast_adapter_dtype=True)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             trainer = Trainer(
                 model=model,
                 train_dataset=self.data["train"],
                 args=TrainingArguments(
-                    fp16=True,
+                    fp16=True,  # <= this is required for the error to be raised
+                    output_dir=tmp_dir,
+                    max_steps=3,
+                ),
+                data_collator=DataCollatorForLanguageModeling(self.tokenizer, mlm=False),
+            )
+            trainer.train()  # does not raise
+
+    @pytest.mark.single_gpu_tests
+    def test_model_using_float16_explicit_cast(self):
+        # Same test as above but containing the fix to make it work
+        model = AutoModelForCausalLM.from_pretrained(
+            self.causal_lm_model_id,
+            torch_dtype=torch.float16,
+        )
+        model = get_peft_model(model, self.config, autocast_adapter_dtype=False)
+
+        # here we manually promote the adapter weights to float32
+        for param in model.parameters():
+            if param.requires_grad:
+                param.data = param.data.float()
+
+        dtype_counts_before = Counter(p.dtype for p in model.parameters())
+        model = AutoModelForCausalLM.from_pretrained(
+            self.causal_lm_model_id,
+            torch_dtype=torch.float16,
+        )
+
+        model = get_peft_model(model, self.config, autocast_adapter_dtype=True)
+        dtype_counts_after = Counter(p.dtype for p in model.parameters())
+        assert dtype_counts_before == dtype_counts_after
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            trainer = Trainer(
+                model=model,
+                train_dataset=self.data["train"],
+                args=TrainingArguments(
+                    fp16=True,  # <= this is required for the error to be raised
                     max_steps=3,
                     output_dir=tmp_dir,
                 ),
                 data_collator=DataCollatorForLanguageModeling(self.tokenizer, mlm=False),
             )
-            trainer.train()
+            trainer.train()  # does not raise
+
+    @pytest.mark.single_gpu_tests
+    def test_load_model_using_float16_with_amp_raises(self):
+        # Same as previous tests, but loading the adapter with PeftModel.from_pretrained instead
+        model = AutoModelForCausalLM.from_pretrained(
+            self.causal_lm_model_id,
+            torch_dtype=torch.float16,
+        )
+        model = get_peft_model(model, self.config, autocast_adapter_dtype=False)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model.save_pretrained(tmp_dir)
+            model = AutoModelForCausalLM.from_pretrained(self.causal_lm_model_id, torch_dtype=torch.float16)
+            model = PeftModel.from_pretrained(model, tmp_dir, autocast_adapter_dtype=False, is_trainable=True)
+
+            trainer = Trainer(
+                model=model,
+                train_dataset=self.data["train"],
+                args=TrainingArguments(
+                    fp16=True,  # <= this is required for the error to be raised
+                    output_dir=tmp_dir,
+                    max_steps=3,
+                ),
+                data_collator=DataCollatorForLanguageModeling(self.tokenizer, mlm=False),
+            )
+            with pytest.raises(ValueError, match="Attempting to unscale FP16 gradients."):
+                trainer.train()
+
+    @pytest.mark.single_gpu_tests
+    def test_load_model_using_float16_autocast_dtype(self):
+        # Same as previous tests, but loading the adapter with PeftModel.from_pretrained instead
+        model = AutoModelForCausalLM.from_pretrained(
+            self.causal_lm_model_id,
+            torch_dtype=torch.float16,
+        )
+        # Below, we purposefully set autocast_adapter_dtype=False so that the saved adapter uses float16. We still want
+        # the loaded adapter to use float32 when we load it with autocast_adapter_dtype=True.
+        model = get_peft_model(model, self.config, autocast_adapter_dtype=False)
+        # sanity check: this should have float16 adapter weights:
+        assert (
+            model.base_model.model.model.decoder.layers[0].self_attn.v_proj.lora_A["default"].weight.dtype
+            == torch.float16
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model.save_pretrained(tmp_dir)
+            model = AutoModelForCausalLM.from_pretrained(self.causal_lm_model_id, torch_dtype=torch.float16)
+            model = PeftModel.from_pretrained(model, tmp_dir, autocast_adapter_dtype=True, is_trainable=True)
+            # sanity check: this should NOT have float16 adapter weights:
+            assert (
+                model.base_model.model.model.decoder.layers[0].self_attn.v_proj.lora_A["default"].weight.dtype
+                == torch.float32
+            )
+
+            trainer = Trainer(
+                model=model,
+                train_dataset=self.data["train"],
+                args=TrainingArguments(
+                    fp16=True,  # <= this is required for the error to be raised
+                    output_dir=tmp_dir,
+                    max_steps=3,
+                ),
+                data_collator=DataCollatorForLanguageModeling(self.tokenizer, mlm=False),
+            )
+            trainer.train()  # does not raise
+
+    @pytest.mark.single_gpu_tests
+    def test_load_adapter_using_float16_autocast_dtype(self):
+        # Here we test the load_adapter method with autocast_adapter_dtype. We show that autocasting is prevented when
+        # calling load_model(..., autocast_adapter_dtype=False) and that it is enabled when calling
+        # load_model(..., autocast_adapter_dtype=True) (the default).
+        model = AutoModelForCausalLM.from_pretrained(
+            self.causal_lm_model_id,
+            torch_dtype=torch.float16,
+        )
+        # Below, we purposefully set autocast_adapter_dtype=False so that the saved adapter uses float16. We still want
+        # the loaded adapter to use float32 when we load it with autocast_adapter_dtype=True.
+        model = get_peft_model(model, self.config, autocast_adapter_dtype=False)
+        # sanity check: this should have float16 adapter weights:
+        assert (
+            model.base_model.model.model.decoder.layers[0].self_attn.v_proj.lora_A["default"].weight.dtype
+            == torch.float16
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model.save_pretrained(tmp_dir)
+            model = AutoModelForCausalLM.from_pretrained(self.causal_lm_model_id, torch_dtype=torch.float16)
+            # the default adapter is now in float16
+            model = get_peft_model(model, self.config, autocast_adapter_dtype=False)
+            # sanity check: this should NOT have float16 adapter weights:
+            assert (
+                model.base_model.model.model.decoder.layers[0].self_attn.v_proj.lora_A["default"].weight.dtype
+                == torch.float16
+            )
+
+            # now load the first adapter in float16 using the adapter name "loaded16"
+            model.load_adapter(tmp_dir, "loaded16", autocast_adapter_dtype=False)
+            assert (
+                model.base_model.model.model.decoder.layers[0].self_attn.v_proj.lora_A["loaded16"].weight.dtype
+                == torch.float16
+            )
+
+            # now load the first adapter in float32 using the adapter name "loaded32"
+            model.load_adapter(tmp_dir, "loaded32", autocast_adapter_dtype=True)
+            assert (
+                model.base_model.model.model.decoder.layers[0].self_attn.v_proj.lora_A["loaded32"].weight.dtype
+                == torch.float32
+            )
+
+            # training with the default adapter, which is in float16, should raise
+            model.set_adapter("default")
+            trainer = Trainer(
+                model=model,
+                train_dataset=self.data["train"],
+                args=TrainingArguments(
+                    fp16=True,  # <= this is required for the error to be raised
+                    output_dir=tmp_dir,
+                    max_steps=3,
+                ),
+                data_collator=DataCollatorForLanguageModeling(self.tokenizer, mlm=False),
+            )
+            with pytest.raises(ValueError, match="Attempting to unscale FP16 gradients."):
+                trainer.train()
+
+            # training the model with the adapter "loaded16", which is in float16, should also raise
+            model.set_adapter("loaded16")
+            trainer = Trainer(
+                model=model,
+                train_dataset=self.data["train"],
+                args=TrainingArguments(
+                    fp16=True,  # <= this is required for the error to be raised
+                    output_dir=tmp_dir,
+                    max_steps=3,
+                ),
+                data_collator=DataCollatorForLanguageModeling(self.tokenizer, mlm=False),
+            )
+            with pytest.raises(ValueError, match="Attempting to unscale FP16 gradients."):
+                trainer.train()
+
+            # training the model with the adapter "loaded32", which is in float32, should not raise
+            model.set_adapter("loaded32")
+            trainer = Trainer(
+                model=model,
+                train_dataset=self.data["train"],
+                args=TrainingArguments(
+                    fp16=True,  # <= this is required for the error to be raised
+                    output_dir=tmp_dir,
+                    max_steps=3,
+                ),
+                data_collator=DataCollatorForLanguageModeling(self.tokenizer, mlm=False),
+            )
+            trainer.train()  # does not raise
 
 
 @require_torch_gpu
@@ -2132,6 +2458,182 @@ class PeftAqlmGPUTests(unittest.TestCase):
 
             # assert loss is not None
             assert trainer.state.log_history[-1]["train_loss"] is not None
+
+
+@require_torch_gpu
+@require_hqq
+@unittest.skipUnless(
+    version.parse(importlib.metadata.version("transformers")) >= version.parse("4.36.1"),
+    "test requires `transformers>=4.36.1`",
+)
+class PeftHqqGPUTests(unittest.TestCase):
+    r"""
+    HQQ + peft tests
+    """
+
+    def setUp(self):
+        self.causal_lm_model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        self.tokenizer = AutoTokenizer.from_pretrained(self.causal_lm_model_id)
+
+    def tearDown(self):
+        r"""
+        Efficient mechanism to free GPU memory after each test. Based on
+        https://github.com/huggingface/transformers/issues/21094
+        """
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.mark.single_gpu_tests
+    @parameterized.expand([False, True])
+    def test_causal_lm_training_hqq(self, use_dora):
+        r"""
+        Test the CausalLM training on a single GPU device. The test would simply fail if the adapters are not set
+        correctly.
+        """
+
+        from transformers import HqqConfig
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            device = "cuda"
+            compute_dtype = torch.float16
+
+            quant_config = HqqConfig(nbits=4, group_size=64)
+
+            model = AutoModelForCausalLM.from_pretrained(
+                self.causal_lm_model_id,
+                device_map=device,
+                torch_dtype=compute_dtype,
+                quantization_config=quant_config,
+            )
+
+            model = prepare_model_for_kbit_training(model)
+            config = LoraConfig(
+                r=16,
+                lora_alpha=32,
+                target_modules=["q_proj", "v_proj"],
+                lora_dropout=0.05,
+                bias="none",
+                task_type="CAUSAL_LM",
+                use_dora=use_dora,
+            )
+            model = get_peft_model(model, config)
+
+            data = load_dataset("ybelkada/english_quotes_copy")
+            data = data.map(lambda samples: self.tokenizer(samples["quote"]), batched=True)
+
+            trainer = Trainer(
+                model=model,
+                train_dataset=data["train"],
+                args=TrainingArguments(
+                    per_device_train_batch_size=4,
+                    gradient_accumulation_steps=4,
+                    warmup_steps=2,
+                    max_steps=3,
+                    learning_rate=2e-4,
+                    logging_steps=1,
+                    output_dir=tmp_dir,
+                    fp16=True,
+                ),
+                data_collator=DataCollatorForLanguageModeling(self.tokenizer, mlm=False),
+            )
+            model.config.use_cache = False
+            trainer.train()
+
+            model.save_pretrained(tmp_dir)
+
+            assert "adapter_config.json" in os.listdir(tmp_dir)
+            assert SAFETENSORS_WEIGHTS_NAME in os.listdir(tmp_dir)
+
+            # assert loss is not None
+            assert trainer.state.log_history[-1]["train_loss"] is not None
+
+    @pytest.mark.single_gpu_tests
+    def test_hqq_lora_model_outputs(self):
+        # check that the outputs generated by HQQ with LoRA are similar to those without HQQ
+        from transformers import HqqConfig
+
+        device = "cuda"
+        compute_dtype = torch.float16
+
+        # first load the model without HQQ
+        model = AutoModelForCausalLM.from_pretrained(
+            self.causal_lm_model_id,
+            device_map=device,
+            torch_dtype=compute_dtype,
+        )
+        config = LoraConfig(
+            target_modules=["q_proj", "v_proj"],
+            task_type="CAUSAL_LM",
+            init_lora_weights=False,
+        )
+        torch.manual_seed(0)
+        model = get_peft_model(model, config).eval()
+        inputs = self.tokenizer("The meaning of unit tests is", return_tensors="pt").to(model.device)
+
+        with torch.inference_mode():
+            output_normal = model(**inputs).logits
+        assert torch.isfinite(output_normal).all()
+
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # now load with HQQ
+        quant_config = HqqConfig(nbits=4, group_size=64)
+        model = AutoModelForCausalLM.from_pretrained(
+            self.causal_lm_model_id,
+            device_map=device,
+            torch_dtype=compute_dtype,
+            quantization_config=quant_config,
+        )
+        torch.manual_seed(0)
+        model = get_peft_model(model, config).eval()
+        with torch.inference_mode():
+            output_hqq = model(**inputs).logits
+
+        # check that outputs of HQQ are highly correlated; there are outliers, so don't check for equality
+        cc_matrix = torch.corrcoef(torch.stack((output_normal.flatten(), output_hqq.flatten())))
+        assert cc_matrix.min() > 0.97
+
+        # check that outputs are the same after merging
+        cc_matrix = torch.corrcoef(torch.stack((output_normal.flatten(), output_hqq.flatten())))
+        assert cc_matrix.min() > 0.97
+
+        # check outputs are the same after unmerging
+        model.unmerge_adapter()
+        with torch.inference_mode():
+            output_unmerged = model(**inputs).logits
+        cc_matrix = torch.corrcoef(torch.stack((output_normal.flatten(), output_unmerged.flatten())))
+        assert cc_matrix.min() > 0.97
+
+        # check that the results are the same after saving and loading
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model.save_pretrained(tmp_dir)
+            del model
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            quant_config = HqqConfig(nbits=4, group_size=64)
+            model = AutoModelForCausalLM.from_pretrained(
+                self.causal_lm_model_id,
+                device_map=device,
+                torch_dtype=compute_dtype,
+                quantization_config=quant_config,
+            )
+            model = PeftModel.from_pretrained(model, tmp_dir)
+            with torch.inference_mode():
+                output_loaded = model(**inputs).logits
+
+            # for loading, we expect high precision, so check for equality and not just correlation
+            atol, rtol = 1e-6, 1e-6
+            assert torch.allclose(output_hqq, output_loaded, atol=atol, rtol=rtol)
+
+        # check that outputs are the same after merge_and_unload
+        model = model.merge_and_unload()
+        with torch.inference_mode():
+            output_merged_unloaded = model(**inputs).logits
+        cc_matrix = torch.corrcoef(torch.stack((output_normal.flatten(), output_merged_unloaded.flatten())))
+        assert cc_matrix.min() > 0.97
 
 
 # TODO: unskip the tests once https://github.com/casper-hansen/AutoAWQ/issues/466 is fixed
@@ -2533,3 +3035,44 @@ class TestAutoCast(unittest.TestCase):
         with torch.autocast(enabled=True, dtype=precision, device_type="cuda"):
             outputs = model(input_ids)
             assert outputs.dtype == precision
+
+
+class TestFSDPWrap:
+    """
+    Test that we can successfully initialize an FSDP instance of the module.
+
+    This is a very simple test, as it does not perform actual FSDP training. Here we just ensure that the FSDP instance
+    can be created. This can fail for several reasons, e.g. int dtype from BNB or inconsistent requires_grad settings
+    due to the auto wrap policy.
+
+    """
+
+    @pytest.mark.single_gpu_tests
+    @require_bitsandbytes
+    def test_bnb_4bit_wrap_fsdp(self):
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            # float32 must be used, or else FSDP will complain about mixed int and float dtypes
+            bnb_4bit_compute_dtype=torch.float32,
+            bnb_4bit_quant_storage=torch.float32,
+            bnb_4bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            "facebook/opt-125m",
+            quantization_config=quant_config,
+            torch_dtype=torch.float32,
+        )
+        # model = prepare_model_for_kbit_training(model)
+        config = LoraConfig(
+            target_modules=["q_proj", "v_proj"],
+            task_type="CAUSAL_LM",
+            use_dora=True,
+        )
+        model = get_peft_model(model, config)
+
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "29501"
+
+        init_process_group(world_size=1, rank=0)
+        # check that this does not raise:
+        FSDP(model, auto_wrap_policy=fsdp_auto_wrap_policy(model), use_orig_params=False, sync_module_states=True)

@@ -23,7 +23,7 @@ from transformers.pytorch_utils import Conv1D
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 from peft.utils.other import transpose
 
-from .buffer_dict import BufferDict
+from .._buffer_dict import BufferDict
 
 
 class VeraLayer(BaseTunerLayer):
@@ -106,14 +106,7 @@ class VeraLayer(BaseTunerLayer):
         if init_weights:
             self.reset_vera_parameters(adapter_name, d_initial=d_initial)
 
-        weight = getattr(self.get_base_layer(), "weight", None)
-        if weight is not None:
-            # the layer is already completely initialized, this is an update
-            if weight.dtype.is_floating_point or weight.dtype.is_complex:
-                self.to(weight.device, dtype=weight.dtype)
-            else:
-                self.to(weight.device)
-
+        self._move_adapter_to_device_of_base_layer(adapter_name)
         self.set_adapter(self.active_adapters)
 
     def reset_vera_parameters(self, adapter_name, d_initial: float = 0.1):
@@ -224,9 +217,11 @@ class Linear(nn.Linear, VeraLayer):
             lambda_d = lambda_d.float()
             lambda_b = lambda_b.float()
 
+        sliced_A = vera_A[:, : self.in_features]
+        sliced_B = vera_B[: self.out_features, :]
         lambda_b = lambda_b.unsqueeze(-1)
         lambda_d = lambda_d.unsqueeze(-1)
-        output_tensor = transpose((lambda_b * vera_B) @ (lambda_d * vera_A), self.fan_in_fan_out)
+        output_tensor = transpose((lambda_b * sliced_B) @ (lambda_d * sliced_A), self.fan_in_fan_out)
 
         if cast_to_fp32:
             output_tensor = output_tensor.to(dtype=dtype)
@@ -259,9 +254,19 @@ class Linear(nn.Linear, VeraLayer):
                 vera_A = self.vera_A[active_adapter]
                 vera_B = self.vera_B[active_adapter]
 
+                # As adapted layers may have different shapes and VeRA contains a single shared pair of A and B matrices,
+                # we initialize these matrices with the largest required size for each dimension.
+                # During the forward pass, required submatrices are sliced out from the shared vera_A and vera_B.
+                sliced_A = vera_A[:, : self.in_features]
+                sliced_B = vera_B[: self.out_features, :]
+
                 dropout = self.vera_dropout[active_adapter]
                 x = x.to(lambda_d.dtype)
-                result = result + lambda_b * F.linear(lambda_d * F.linear(dropout(x), vera_A), vera_B)
+                result = result + lambda_b * F.linear(lambda_d * F.linear(dropout(x), sliced_A), sliced_B)
 
         result = result.to(previous_dtype)
         return result
+
+    def __repr__(self) -> str:
+        rep = super().__repr__()
+        return "vera." + rep
