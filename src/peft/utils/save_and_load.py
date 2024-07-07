@@ -113,7 +113,7 @@ def get_peft_model_state_dict(
 
             to_return = {renamed_dora_weights(k): v for k, v in to_return.items()}
             
-    if config.peft_type == PeftType.PiSSA:
+    elif config.peft_type == PeftType.PiSSA:
         bias = config.bias
         if bias == "none":
             to_return = {k: state_dict[k] for k in state_dict if "pissa_" in k}
