@@ -28,6 +28,8 @@ class PiSSAConfig(PeftConfig):
     Args:
         r (`int`):
             PiSSA attention dimension (the "rank").
+        pissa_dropout (`float`):
+            The dropout probability for residual layers, notice which is different from LoRA that dropout the adapter layers.
         target_modules (`Optional[Union[List[str], str]]`):
             The names of the modules to apply the adapter to. If this is specified, only the modules with the specified
             names will be replaced. When passing a string, a regex match will be performed. When passing a list of
@@ -45,18 +47,10 @@ class PiSSAConfig(PeftConfig):
             will not produce the same output as the base model would have without adaptation.
         modules_to_save (`List[str]`):
             List of modules apart from adapter layers to be set as trainable and saved in the final checkpoint.
-        init_pissa_weights (`bool` | `Literal["gaussian", "opissa", "pissa", "pissa_niter_[number of iters]"]`):
+        init_pissa_weights (`bool`):
             How to initialize the weights of the adapter layers. Passing True (default) results in the default
-            initialization from the reference implementation from Microsoft. Passing 'gaussian' results in Gaussian
-            initialization scaled by the PiSSA rank for linear and layers. Setting the initialization to False leads to
-            completely random initialization and is discouraged. Pass
-            `'opissa'` to use OPiSSA initialization. Passing 'pissa' results in the initialization of PiSSA, which
-            converge more rapidly than PiSSA and ultimately achieve superior performance. Moreover, PiSSA reduces the
-            quantization error compared to QPiSSA, leading to further enhancements. Passing 'pissa_niter_[number of
-            iters]' initiates Fast-SVD-based PiSSA initialization, where [number of iters] indicates the number of
-            subspace iterations to perform FSVD, and must be a nonnegative integer. When the [number of iters] is set
-            to 16, it can complete the initialization of a 7b model within seconds, and the training effect is
-            approximately equivalent to using SVD. For more information, see <a
+            initialization from the reference implementation from PiSSA. Setting the initialization to False leads to
+            completely random initialization and is discouraged. For more information, see <a
             href='https://arxiv.org/abs/2404.02948'>Principal Singular values and Singular vectors Adaptation</a>.
         layers_to_transform (`Union[List[int], int]`):
             The layer indices to transform. If a list of ints is passed, it will apply the adapter to the layer indices
@@ -81,6 +75,7 @@ class PiSSAConfig(PeftConfig):
     """
 
     r: int = field(default=8, metadata={"help": "PiSSA attention dimension"})
+    pissa_dropout: float = field(default=0.0, metadata={"help": "PiSSA dropout"})
     target_modules: Optional[Union[list[str], str]] = field(
         default=None,
         metadata={

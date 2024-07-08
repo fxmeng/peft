@@ -42,7 +42,6 @@ from peft.utils import (
     _freeze_adapter,
     _get_submodules,
     get_peft_model_state_dict,
-    get_quantization_config,
 )
 from peft.utils.merge_utils import dare_linear, dare_ties, magnitude_prune, task_arithmetic, ties
 from .config import PiSSAConfig
@@ -146,6 +145,7 @@ class PiSSAModel(BaseTuner):
 
         kwargs = {
             "r": r,
+            "pissa_dropout": pissa_config.pissa_dropout,
             "fan_in_fan_out": pissa_config.fan_in_fan_out,
             "init_pissa_weights": pissa_config.init_pissa_weights,
             "fsvd": pissa_config.fsvd,
@@ -817,3 +817,19 @@ class PiSSAModel(BaseTuner):
                 )
 
         return tensors_pissa
+
+    def freeze_a_singular_vector(self, adapter_name="default", freeze_U=False, freeze_V=False):
+        for module in self.modules():
+            if isinstance(module, PiSSALayer):
+                if len(module.pissa_U) and len(module.pissa_V):
+                    if not freeze_U and not freeze_V:
+                        freeze_U = module.pissa_U[adapter_name].weight.numel()>=module.pissa_V[adapter_name].weight.numel()
+                        freeze_V = module.pissa_U[adapter_name].weight.numel()<module.pissa_V[adapter_name].weight.numel()
+                    module.pissa_U[adapter_name].requires_grad_(not freeze_U)
+                    module.pissa_V[adapter_name].requires_grad_(not freeze_V)
+                elif len(module.pissa_embedding_U) and len(module.pissa_embedding_V):
+                    if not freeze_U and not freeze_V:
+                        freeze_U = module.pissa_embedding_U[adapter_name].numel()>=module.pissa_embedding_V[adapter_name].numel()
+                        freeze_V = module.pissa_embedding_U[adapter_name].numel()<module.pissa_embedding_V[adapter_name].numel()
+                    module.pissa_embedding_U[adapter_name].requires_grad_(not freeze_U)
+                    module.pissa_embedding_V[adapter_name].requires_grad_(not freeze_V)

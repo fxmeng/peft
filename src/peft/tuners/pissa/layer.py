@@ -29,7 +29,7 @@ class PiSSALayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
     adapter_layer_names = ("pissa_U", "pissa_S", "pissa_V", "pissa_embedding_U", "pissa_embedding_S", "pissa_embedding_V")
     # All names of other parameters that may contain adapter-related parameters
-    other_param_names = ("r", "fsvd")
+    other_param_names = ("r", "fsvd", "pissa_dropout")
 
     def __init__(self, base_layer: nn.Module, **kwargs) -> None:
         self.base_layer = base_layer
@@ -113,6 +113,7 @@ class Linear(nn.Module, PiSSALayer):
         base_layer,
         adapter_name: str,
         r: int = 0,
+        pissa_dropout: float = 0.0,
         fsvd: int = None,
         fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
         is_target_conv_1d_layer: bool = False,
@@ -127,13 +128,14 @@ class Linear(nn.Module, PiSSALayer):
         self.update_layer(
             adapter_name,
             r,
+            pissa_dropout,
             init_pissa_weights,
             fsvd=fsvd,
         )
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
     def update_layer(
-        self, adapter_name, r, init_pissa_weights, fsvd
+        self, adapter_name, r, pissa_dropout, init_pissa_weights, fsvd
     ):
         # This code works for linear layers, override for other layer types
         if r <= 0:
@@ -141,6 +143,11 @@ class Linear(nn.Module, PiSSALayer):
 
         self.r[adapter_name] = r
         self.fsvd[adapter_name] = fsvd
+        if pissa_dropout > 0.0:
+            self.pissa_dropout = nn.Dropout(p=pissa_dropout)
+        else:
+            self.pissa_dropout = nn.Identity()
+            
         # Actual trainable parameters
         self.pissa_U[adapter_name] = nn.Linear(self.in_features, r, bias=False)
         self.pissa_S[adapter_name] = nn.Parameter(torch.zeros(r))
@@ -266,7 +273,7 @@ class Linear(nn.Module, PiSSALayer):
     ) -> torch.Tensor:
         # This is a special method that handles the case when users pass the argument `adapter_names`. This is an
         # extra argument that allows mixing different adapters in the same batch at inference time.
-        result = self.base_layer(x, *args, **kwargs)
+        result = self.base_layer(self.pissa_dropout(x), *args, **kwargs)
         torch_result_dtype = result.dtype
 
         unique_adapters = set(adapter_names)
@@ -305,7 +312,7 @@ class Linear(nn.Module, PiSSALayer):
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else:
-            result = self.base_layer(x, *args, **kwargs)
+            result = self.base_layer(self.pissa_dropout(x), *args, **kwargs)
             torch_result_dtype = result.dtype
             for active_adapter in self.active_adapters:
                 if active_adapter not in self.pissa_U.keys():
@@ -331,6 +338,7 @@ class Embedding(nn.Module, PiSSALayer):
         base_layer: nn.Module,
         adapter_name: str,
         r: int = 0,
+        pissa_dropout: float = 0.0,
         init_pissa_weights: Union[bool, str] = True,
         fsvd: int = None,
         **kwargs,
@@ -342,11 +350,12 @@ class Embedding(nn.Module, PiSSALayer):
         self.update_layer(
             adapter_name,
             r,
+            pissa_dropout=pissa_dropout,
             init_pissa_weights=init_pissa_weights,
             fsvd=fsvd
         )
 
-    def update_layer(self, adapter_name, r, init_pissa_weights, fsvd):
+    def update_layer(self, adapter_name, r, pissa_dropout, init_pissa_weights, fsvd):
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
 
@@ -471,7 +480,7 @@ class Embedding(nn.Module, PiSSALayer):
         # This is a special method that handles the case when users pass the argument `adapter_names`. This is an
         # extra argument that allows mixing different adapters in the same batch at inference time.
         result = self.base_layer(x, *args, **kwargs)
-
+        
         unique_adapters = set(adapter_names)
         sub_batch_indices_list = []
         for adapter in unique_adapters:
@@ -547,6 +556,7 @@ class Conv2d(nn.Module, PiSSALayer):
         base_layer: nn.Module,
         adapter_name: str,
         r: int = 0,
+        pissa_dropout: float = 0.0,
         init_pissa_weights: Union[bool, str] = True,
         fsvd: int = None,
         **kwargs,
@@ -558,16 +568,21 @@ class Conv2d(nn.Module, PiSSALayer):
         self.update_layer(
             adapter_name,
             r,
+            pissa_dropout,
             init_pissa_weights=init_pissa_weights,
             fsvd=fsvd
         )
 
-    def update_layer(self, adapter_name, r, init_pissa_weights, fsvd):
+    def update_layer(self, adapter_name, r, pissa_dropout, init_pissa_weights, fsvd):
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
 
         self.r[adapter_name] = r
         self.fsvd[adapter_name] = fsvd
+        if pissa_dropout > 0.0:
+            self.pissa_dropout = nn.Dropout(p=pissa_dropout)
+        else:
+            self.pissa_dropout = nn.Identity()
         # Actual trainable parameters
         base_layer = self.get_base_layer()
         kernel_size = base_layer.kernel_size
@@ -702,7 +717,7 @@ class Conv2d(nn.Module, PiSSALayer):
     ) -> torch.Tensor:
         # This is a special method that handles the case when users pass the argument `adapter_names`. This is an
         # extra argument that allows mixing different adapters in the same batch at inference time.
-        result = self.base_layer(x, *args, **kwargs)
+        result = self.base_layer(self.pissa_dropout(x), *args, **kwargs)
         torch_result_dtype = result.dtype
 
         unique_adapters = set(adapter_names)
@@ -742,7 +757,7 @@ class Conv2d(nn.Module, PiSSALayer):
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else:
-            result = self.base_layer(x, *args, **kwargs)
+            result = self.base_layer(self.pissa_dropout(x), *args, **kwargs)
             torch_result_dtype = result.dtype
 
             for active_adapter in self.active_adapters:
