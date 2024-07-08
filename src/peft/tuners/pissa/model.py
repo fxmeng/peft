@@ -157,6 +157,7 @@ class PiSSAModel(BaseTuner):
             target.update_layer(
                 adapter_name,
                 r,
+                pissa_dropout=pissa_config.pissa_dropout,
                 init_pissa_weights=pissa_config.init_pissa_weights,
                 fsvd = pissa_config.fsvd,
             )
