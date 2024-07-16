@@ -145,6 +145,7 @@ class PiSSAModel(BaseTuner):
 
         kwargs = {
             "r": r,
+            "singular_value": pissa_config.singular_value,
             "pissa_dropout": pissa_config.pissa_dropout,
             "fan_in_fan_out": pissa_config.fan_in_fan_out,
             "init_pissa_weights": pissa_config.init_pissa_weights,
@@ -819,18 +820,21 @@ class PiSSAModel(BaseTuner):
 
         return tensors_pissa
 
-    def freeze_a_singular_vector(self, adapter_name="default", freeze_U=False, freeze_V=False):
+    def freeze_usv(self, adapter_name="default", freeze_U=False, freeze_S=False, freeze_V=False, auto_freeze_UV=False):
         for module in self.modules():
             if isinstance(module, PiSSALayer):
-                if len(module.pissa_U) and len(module.pissa_V):
-                    if not freeze_U and not freeze_V:
+                if adapter_name in module.pissa_U.keys() and adapter_name in module.pissa_V.keys():
+                #if len(module.pissa_U) and len(module.pissa_V):
+                    if auto_freeze_UV:
                         freeze_U = module.pissa_U[adapter_name].weight.numel()>=module.pissa_V[adapter_name].weight.numel()
                         freeze_V = module.pissa_U[adapter_name].weight.numel()<module.pissa_V[adapter_name].weight.numel()
                     module.pissa_U[adapter_name].requires_grad_(not freeze_U)
+                    module.pissa_S[adapter_name].requires_grad_(not freeze_S)
                     module.pissa_V[adapter_name].requires_grad_(not freeze_V)
                 elif len(module.pissa_embedding_U) and len(module.pissa_embedding_V):
-                    if not freeze_U and not freeze_V:
+                    if auto_freeze_UV:
                         freeze_U = module.pissa_embedding_U[adapter_name].numel()>=module.pissa_embedding_V[adapter_name].numel()
                         freeze_V = module.pissa_embedding_U[adapter_name].numel()<module.pissa_embedding_V[adapter_name].numel()
                     module.pissa_embedding_U[adapter_name].requires_grad_(not freeze_U)
+                    module.pissa_embedding_S[adapter_name].requires_grad_(not freeze_S)
                     module.pissa_embedding_V[adapter_name].requires_grad_(not freeze_V)

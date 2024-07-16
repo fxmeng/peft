@@ -76,6 +76,19 @@ class PiSSAConfig(PeftConfig):
 
     r: int = field(default=8, metadata={"help": "PiSSA attention dimension"})
     pissa_dropout: float = field(default=0.0, metadata={"help": "PiSSA dropout"})
+    singular_value: Optional[str] = field(
+        default="vector",
+        metadata={
+            "help": (
+                "`to_u`: merge the singular value to the left singular vector."
+                "`to_v`: merge the singular value to the left singular vector."
+                "`to_uv`: merge the square root of the singular value to both singular vector."
+                "`vector`: preserve the singular value as a vector for finetuning."
+                "`matrix`: preserve the singular value in matrix format for finetuning."
+                "`freeze`: preserve the singular value as a vector but freeze it when training."
+            )
+        },
+    )
     target_modules: Optional[Union[list[str], str]] = field(
         default=None,
         metadata={
