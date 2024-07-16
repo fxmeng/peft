@@ -30,6 +30,18 @@ class PiSSAConfig(PeftConfig):
             PiSSA attention dimension (the "rank").
         pissa_dropout (`float`):
             The dropout probability for residual layers, notice which is different from LoRA that dropout the adapter layers.
+        singular_value: Optional[str]:
+            How to deal with the singular_value. `to_u` or `to_v` will merge it to the left/right singular vector."
+            "`to_uv`: will merge the square root of S to both U and V."
+            "`vector`: preserve the singular value as a vector for finetuning."
+            "`matrix`: preserve the singular value in matrix format for finetuning."
+        negative_v: bool:
+            "Subtraction the right singular vector to keep the output of PiSSA adapter is zero."
+            "This allows needn't change the base model. Negative_V layer should be keep frozen."
+        freeze: Optional[str]:
+            freeze "`USVA`" layers. "If negative_v=True, V will never be freezed;"
+            "elif the input contain `A`, will freeze one of U and V which has more number of parameters."
+            "elif the input contain `U` or `V`, will freeze the corresponding components."
         target_modules (`Optional[Union[List[str], str]]`):
             The names of the modules to apply the adapter to. If this is specified, only the modules with the specified
             names will be replaced. When passing a string, a regex match will be performed. When passing a list of
@@ -85,9 +97,25 @@ class PiSSAConfig(PeftConfig):
                 "`to_uv`: merge the square root of the singular value to both singular vector."
                 "`vector`: preserve the singular value as a vector for finetuning."
                 "`matrix`: preserve the singular value in matrix format for finetuning."
-                "`freeze`: preserve the singular value as a vector but freeze it when training."
             )
         },
+    )
+    freeze: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "`USVA`"
+                "When the input contain `U`, will freeze the left singular vector."
+                "When the input contain `V`, will freeze the right singular vector."
+                "When the input contain `S`, will freeze the singular value."
+                "When the input contain `A`, will freeze one of U and V which has more number of parameters."
+            )
+        },
+    )
+    negative_v: bool = field(
+        default=False,
+        metadata={"help": "Subtraction the right singular vector to keep the output of PiSSA adapter is zero."
+                  "It's similar to vanilla PiSSA, while needn't change the base model."},
     )
     target_modules: Optional[Union[list[str], str]] = field(
         default=None,
@@ -224,3 +252,6 @@ class PiSSAConfig(PeftConfig):
         # if target_modules is a regex expression, then layers_pattern should be None
         if isinstance(self.target_modules, str) and self.layers_pattern is not None:
             raise ValueError("`layers_pattern` cannot be used when `target_modules` is a str.")
+        
+        if self.singular_value not in ["to_u","to_v","to_uv","vector","matrix"]:
+            raise ValueError("`singular_value` must be one of [`to_u`,`to_v`,`to_uv`,`vector`,`matrix`]")

@@ -93,6 +93,9 @@ class PiSSAModel(BaseTuner):
 
     def __init__(self, model, config, adapter_name) -> None:
         super().__init__(model, config, adapter_name)
+        self.freeze_usv(adapter_name, config[adapter_name].freeze, config[adapter_name].negative_v)
+                
+                
 
     def _check_new_adapter_config(self, config: PiSSAConfig) -> None:
         """
@@ -146,6 +149,7 @@ class PiSSAModel(BaseTuner):
         kwargs = {
             "r": r,
             "singular_value": pissa_config.singular_value,
+            "negative_v": pissa_config.negative_v,
             "pissa_dropout": pissa_config.pissa_dropout,
             "fan_in_fan_out": pissa_config.fan_in_fan_out,
             "init_pissa_weights": pissa_config.init_pissa_weights,
@@ -158,6 +162,7 @@ class PiSSAModel(BaseTuner):
             target.update_layer(
                 adapter_name,
                 r,
+                singular_value=pissa_config.singular_value,
                 pissa_dropout=pissa_config.pissa_dropout,
                 init_pissa_weights=pissa_config.init_pissa_weights,
                 fsvd = pissa_config.fsvd,
@@ -820,21 +825,29 @@ class PiSSAModel(BaseTuner):
 
         return tensors_pissa
 
-    def freeze_usv(self, adapter_name="default", freeze_U=False, freeze_S=False, freeze_V=False, auto_freeze_UV=False):
+    def freeze_usv(self, adapter_name="default", freeze=None, negative_v=False):
         for module in self.modules():
             if isinstance(module, PiSSALayer):
-                if adapter_name in module.pissa_U.keys() and adapter_name in module.pissa_V.keys():
-                #if len(module.pissa_U) and len(module.pissa_V):
-                    if auto_freeze_UV:
-                        freeze_U = module.pissa_U[adapter_name].weight.numel()>=module.pissa_V[adapter_name].weight.numel()
-                        freeze_V = module.pissa_U[adapter_name].weight.numel()<module.pissa_V[adapter_name].weight.numel()
-                    module.pissa_U[adapter_name].requires_grad_(not freeze_U)
-                    module.pissa_S[adapter_name].requires_grad_(not freeze_S)
-                    module.pissa_V[adapter_name].requires_grad_(not freeze_V)
-                elif len(module.pissa_embedding_U) and len(module.pissa_embedding_V):
-                    if auto_freeze_UV:
-                        freeze_U = module.pissa_embedding_U[adapter_name].numel()>=module.pissa_embedding_V[adapter_name].numel()
-                        freeze_V = module.pissa_embedding_U[adapter_name].numel()<module.pissa_embedding_V[adapter_name].numel()
-                    module.pissa_embedding_U[adapter_name].requires_grad_(not freeze_U)
-                    module.pissa_embedding_S[adapter_name].requires_grad_(not freeze_S)
-                    module.pissa_embedding_V[adapter_name].requires_grad_(not freeze_V)
+                if freeze is not None:
+                    if adapter_name in module.pissa_U and adapter_name in module.pissa_V:
+                        if negative_v:
+                            freeze_U = "U" in freeze or "A" in freeze
+                            if "V" in freeze:
+                                warnings.warn(
+                                    f"When negative_v=True, V can't be freeze, else the output of the adapter will always be zero."
+                                )
+                            freeze_V = False
+                        elif "A" in freeze:
+                            freeze_U = module.pissa_U[adapter_name].weight.numel()>=module.pissa_V[adapter_name].weight.numel()
+                            freeze_V = module.pissa_U[adapter_name].weight.numel()<module.pissa_V[adapter_name].weight.numel()
+                        else:
+                            freeze_U = "U" in freeze
+                            freeze_V = "V" in freeze
+                        module.pissa_U[adapter_name].requires_grad_(not freeze_U)
+                        module.pissa_V[adapter_name].requires_grad_(not freeze_V)
+                        
+                    if adapter_name in module.pissa_S:
+                        module.pissa_S[adapter_name].requires_grad_(not "S" in freeze)
+                        
+                if adapter_name in module.negative_V:
+                    module.negative_V[adapter_name].requires_grad_(False)

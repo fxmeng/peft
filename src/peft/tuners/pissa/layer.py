@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import svd_lowrank
+from copy import deepcopy
 
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 from peft.utils.other import transpose
@@ -29,7 +30,7 @@ class PiSSALayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
     adapter_layer_names = ("pissa_U", "pissa_S", "pissa_V", "pissa_embedding_U", "pissa_embedding_S", "pissa_embedding_V")
     # All names of other parameters that may contain adapter-related parameters
-    other_param_names = ("r", "fsvd", "pissa_dropout","singular_value")
+    other_param_names = ("r", "fsvd", "pissa_dropout","singular_value", "negative_v")
 
     def __init__(self, base_layer: nn.Module, **kwargs) -> None:
         self.base_layer = base_layer
@@ -38,10 +39,12 @@ class PiSSALayer(BaseTunerLayer):
         self.pissa_U = nn.ModuleDict({})
         self.pissa_S = nn.ParameterDict({})
         self.pissa_V = nn.ModuleDict({})
+        self.negative_V = nn.ModuleDict({})
         # For Embedding layer
         self.pissa_embedding_U = nn.ParameterDict({})
         self.pissa_embedding_S = nn.ParameterDict({})
         self.pissa_embedding_V = nn.ParameterDict({})
+        self.negative_embedding_V = nn.ParameterDict({})
         # Mark the weight as unmerged
         self._disable_adapters = False
         self.merged_adapters = []
@@ -114,6 +117,7 @@ class Linear(nn.Module, PiSSALayer):
         adapter_name: str,
         r: int = 0,
         singular_value: str = 'vector',
+        negative_v: bool = False,
         pissa_dropout: float = 0.0,
         fsvd: int = None,
         fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
@@ -130,6 +134,7 @@ class Linear(nn.Module, PiSSALayer):
             adapter_name,
             r,
             singular_value,
+            negative_v,
             pissa_dropout,
             init_pissa_weights,
             fsvd=fsvd,
@@ -137,7 +142,7 @@ class Linear(nn.Module, PiSSALayer):
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
     def update_layer(
-        self, adapter_name, r, singular_value, pissa_dropout, init_pissa_weights, fsvd
+        self, adapter_name, r, singular_value, negative_v, pissa_dropout, init_pissa_weights, fsvd
     ):
         # This code works for linear layers, override for other layer types
         if r <= 0:
@@ -153,10 +158,12 @@ class Linear(nn.Module, PiSSALayer):
         # Actual trainable parameters
         self.pissa_U[adapter_name] = nn.Linear(self.in_features, r, bias=False)
         if singular_value == "vector":
-            self.pissa_S[adapter_name] = nn.Parameter(torch.zeros(r), requires_grad=True)
+            self.pissa_S[adapter_name] = nn.Parameter(torch.zeros(r))
         elif singular_value == "matrix":
-            self.pissa_S[adapter_name] = nn.Parameter(torch.zeros(r, r), requires_grad=True)
+            self.pissa_S[adapter_name] = nn.Parameter(torch.zeros(r, r))
         self.pissa_V[adapter_name] = nn.Linear(r, self.out_features, bias=False)
+        if negative_v:
+            self.negative_V[adapter_name] = nn.Linear(r, self.out_features, bias=False)
 
         if init_pissa_weights:
             self.reset_pissa_parameters(adapter_name, singular_value)
@@ -193,10 +200,13 @@ class Linear(nn.Module, PiSSALayer):
             self.pissa_V[adapter_name].weight.data = pissa_V * torch.sqrt(pissa_S)
         else:
             self.pissa_V[adapter_name].weight.data = pissa_V
-            
-        weight = weight.data - pissa_V * pissa_S @ pissa_U
-        weight = weight.to(dtype)
-        self.get_base_layer().weight.data = weight
+        
+        if adapter_name in self.negative_V:
+            self.negative_V[adapter_name].weight.data = -deepcopy(self.pissa_V[adapter_name].weight.data)
+        else:
+            weight = weight.data - pissa_V * pissa_S @ pissa_U
+            weight = weight.to(dtype)
+            self.get_base_layer().weight.data = weight
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
         """
@@ -272,20 +282,28 @@ class Linear(nn.Module, PiSSALayer):
         if adapter in self.pissa_S:
             weight_S = self.pissa_S[adapter]
         weight_V = self.pissa_V[adapter].weight
+        if adapter in self.negative_V:
+            negative_V = self.negative_V[adapter].weight
 
         if cast_to_fp32:
             weight_U = weight_U.float()
             if adapter in self.pissa_S:
                 weight_S = weight_S.float()
             weight_V = weight_V.float()
+            if adapter in self.negative_V:
+                negative_V = negative_V.float()
 
         if adapter in self.pissa_S:
             if len(weight_S.shape)==2:
-                output_tensor = transpose(weight_V @ weight_S @ weight_U, self.fan_in_fan_out)
+                before_V = weight_S @ weight_U
             else:
-                output_tensor = transpose(weight_V * weight_S @ weight_U, self.fan_in_fan_out)
+                before_V = weight_S.unsqueeze(1) *  weight_U
         else:
-            output_tensor = transpose(weight_V @ weight_U, self.fan_in_fan_out)
+            before_V = weight_U
+        output_tensor = transpose(weight_V @ before_V, self.fan_in_fan_out)
+        if adapter in self.negative_V:
+            output_tensor += transpose(negative_V @ before_V, self.fan_in_fan_out)
+            
 
         if cast_to_fp32:
             output_tensor = output_tensor.to(dtype=dtype)
@@ -326,11 +344,17 @@ class Linear(nn.Module, PiSSALayer):
             if active_adapter in self.pissa_S.keys():
                 pissa_S = self.pissa_S[active_adapter]
                 if len(pissa_S.shape)==2:
-                    pissa_output = pissa_V((pissa_U(sub_batch)@pissa_S))
+                    before_V = pissa_U(sub_batch) @ pissa_S
                 else:
-                    pissa_output = pissa_V((pissa_U(sub_batch)*pissa_S))
+                    before_V = pissa_U(sub_batch) * pissa_S
             else:
-                pissa_output = pissa_V((pissa_U(sub_batch)))
+                before_V = pissa_U(sub_batch)
+                
+            pissa_output = pissa_V(before_V)
+            if active_adapter in self.negative_V.keys():
+                negative_V = self.negative_V[active_adapter]
+                pissa_output += negative_V(before_V).detach()
+                
             result[sub_batch_indices_list[i]] += pissa_output.to(torch_result_dtype)
 
         return result
@@ -359,12 +383,16 @@ class Linear(nn.Module, PiSSALayer):
                 if active_adapter in self.pissa_S.keys():
                     pissa_S = self.pissa_S[active_adapter]
                     if len(pissa_S.shape)==2:
-                        result = result + pissa_V((pissa_U(x)@pissa_S))
+                        before_V = pissa_U(x) @ pissa_S
                     else:
-                        result = result + pissa_V((pissa_U(x)*pissa_S))
+                        before_V = pissa_U(x) * pissa_S
                 else:
-                    result = result + pissa_V(pissa_U(x))
-
+                    before_V = pissa_U(x)
+                    
+                result = result + pissa_V(before_V)
+                if active_adapter in self.negative_V.keys():
+                    negative_V = self.negative_V[active_adapter]
+                    result += negative_V(before_V).detach()
             result = result.to(torch_result_dtype)
 
         return result
