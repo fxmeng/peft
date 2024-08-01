@@ -202,13 +202,11 @@ class LoraLayer(BaseTunerLayer):
             V, S, Uh = torch.linalg.svd(weight.data, full_matrices=False)
             Vr = V[:, : self.r[adapter_name]]
             Sr = S[: self.r[adapter_name]]
-            Sr /= self.scaling[adapter_name]
             Uhr = Uh[: self.r[adapter_name]]
         elif len(init_lora_weights.split("_niter_")) == 2:
             Vr, Sr, Ur = svd_lowrank(
                 weight.data, self.r[adapter_name], niter=int(init_lora_weights.split("_niter_")[-1])
             )
-            Sr /= self.scaling[adapter_name]
             Uhr = Ur.t()
         else:
             raise ValueError(

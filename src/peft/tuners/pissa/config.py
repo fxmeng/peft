@@ -37,7 +37,7 @@ class PiSSAConfig(PeftConfig):
             "`matrix`: preserve the singular value in matrix format for finetuning."
         negative_v: bool:
             "Subtraction the right singular vector to keep the output of PiSSA adapter is zero."
-            "This allows needn't change the base model. Negative_V layer should be keep frozen."
+            "This allows needn't change the base model. pissa_V layer should be keep frozen."
         freeze: Optional[str]:
             freeze "`USVA`" layers. "If negative_v=True, V will never be freezed;"
             "elif the input contain `A`, will freeze one of U and V which has more number of parameters."
@@ -89,7 +89,7 @@ class PiSSAConfig(PeftConfig):
     r: int = field(default=8, metadata={"help": "PiSSA attention dimension"})
     pissa_dropout: float = field(default=0.0, metadata={"help": "PiSSA dropout"})
     singular_value: Optional[str] = field(
-        default="vector",
+        default="to_uv",
         metadata={
             "help": (
                 "`to_u`: merge the singular value to the left singular vector."

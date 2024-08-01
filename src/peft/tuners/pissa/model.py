@@ -163,6 +163,7 @@ class PiSSAModel(BaseTuner):
                 adapter_name,
                 r,
                 singular_value=pissa_config.singular_value,
+                negative_v=pissa_config.negative_v,
                 pissa_dropout=pissa_config.pissa_dropout,
                 init_pissa_weights=pissa_config.init_pissa_weights,
                 fsvd = pissa_config.fsvd,
@@ -849,5 +850,5 @@ class PiSSAModel(BaseTuner):
                     if adapter_name in module.pissa_S:
                         module.pissa_S[adapter_name].requires_grad_(not "S" in freeze)
                         
-                if adapter_name in module.negative_V:
-                    module.negative_V[adapter_name].requires_grad_(False)
+                if adapter_name in module.pissa_negV:
+                    module.pissa_negV[adapter_name].requires_grad_(False)
