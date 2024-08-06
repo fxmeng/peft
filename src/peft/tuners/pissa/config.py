@@ -28,19 +28,18 @@ class PiSSAConfig(PeftConfig):
     Args:
         r (`int`):
             PiSSA attention dimension (the "rank").
+        pissa_alpha (`int`):
+            The alpha parameter for pissa scaling.
         pissa_dropout (`float`):
-            The dropout probability for residual layers, notice which is different from LoRA that dropout the adapter layers.
+            The dropout probability for pissa layers.
         singular_value: Optional[str]:
             How to deal with the singular_value. `to_u` or `to_v` will merge it to the left/right singular vector."
             "`to_uv`: will merge the square root of S to both U and V."
             "`vector`: preserve the singular value as a vector for finetuning."
             "`matrix`: preserve the singular value in matrix format for finetuning."
-        negative_v: bool:
-            "Subtraction the right singular vector to keep the output of PiSSA adapter is zero."
-            "This allows needn't change the base model. pissa_V layer should be keep frozen."
         freeze: Optional[str]:
-            freeze "`USVA`" layers. "If negative_v=True, V will never be freezed;"
-            "elif the input contain `A`, will freeze one of U and V which has more number of parameters."
+            freeze "`USVA`" layers.
+            "if the input contain `A`, will freeze one of U and V which has more number of parameters."
             "elif the input contain `U` or `V`, will freeze the corresponding components."
         target_modules (`Optional[Union[List[str], str]]`):
             The names of the modules to apply the adapter to. If this is specified, only the modules with the specified
@@ -50,6 +49,10 @@ class PiSSAConfig(PeftConfig):
             excluding the output layer. If this is not specified, modules will be chosen according to the model
             architecture. If the architecture is not known, an error will be raised -- in this case, you should specify
             the target modules manually.
+        use_rspissa (`bool`):
+            When set to True, uses <a href='https://doi.org/10.48550/arXiv.2312.03732'>Rank-Stabilized LoRA</a> which
+            sets the adapter scaling factor to `pissa_alpha/math.sqrt(r)`, since it was proven to work better.
+            Otherwise, it will use the original default value of `pissa_alpha/r`.
         fan_in_fan_out (`bool`):
             Set this to True if the layer to replace stores weight like (fan_in, fan_out). For example, gpt-2 uses
             `Conv1D` which stores weights like (fan_in, fan_out) and hence this should be set to `True`.
@@ -86,15 +89,14 @@ class PiSSAConfig(PeftConfig):
             all have separate PiSSA adapters attached to them.
     """
 
-    r: int = field(default=8, metadata={"help": "PiSSA attention dimension"})
+    r: int = field(default=8, metadata={"help": "PiSSA rank"})
+    pissa_alpha: int = field(default=8, metadata={"help": "PiSSA alpha"})
     pissa_dropout: float = field(default=0.0, metadata={"help": "PiSSA dropout"})
     singular_value: Optional[str] = field(
-        default="to_uv",
+        default=None,
         metadata={
             "help": (
-                "`to_u`: merge the singular value to the left singular vector."
-                "`to_v`: merge the singular value to the left singular vector."
-                "`to_uv`: merge the square root of the singular value to both singular vector."
+                "`None`: merge the square root of the singular value to both singular vector."
                 "`vector`: preserve the singular value as a vector for finetuning."
                 "`matrix`: preserve the singular value in matrix format for finetuning."
             )
@@ -112,11 +114,6 @@ class PiSSAConfig(PeftConfig):
             )
         },
     )
-    negative_v: bool = field(
-        default=False,
-        metadata={"help": "Subtraction the right singular vector to keep the output of PiSSA adapter is zero."
-                  "It's similar to vanilla PiSSA, while needn't change the base model."},
-    )
     target_modules: Optional[Union[list[str], str]] = field(
         default=None,
         metadata={
@@ -127,6 +124,17 @@ class PiSSAConfig(PeftConfig):
                 "If not specified, modules will be chosen according to the model architecture, If the architecture is "
                 "not known, an error will be raised -- in this case, you should specify the target modules manually."
             ),
+        },
+    )
+    use_rspissa: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When set to True, uses <a href='https://doi.org/10.48550/arXiv.2312.03732'>Rank-Stabilized LoRA</a>"
+                " which sets the adapter scaling factor to `pissa_alpha/math.sqrt(r)`, since it"
+                " was proven to work better. Otherwise, it will use the original default"
+                " value of `pissa_alpha/r`."
+            )
         },
     )
     fan_in_fan_out: bool = field(
@@ -253,5 +261,5 @@ class PiSSAConfig(PeftConfig):
         if isinstance(self.target_modules, str) and self.layers_pattern is not None:
             raise ValueError("`layers_pattern` cannot be used when `target_modules` is a str.")
         
-        if self.singular_value not in ["to_u","to_v","to_uv","vector","matrix"]:
-            raise ValueError("`singular_value` must be one of [`to_u`,`to_v`,`to_uv`,`vector`,`matrix`]")
+        if self.singular_value not in [None,"vector","matrix"]:
+            raise ValueError("`singular_value` must be one of [None,`vector`,`matrix`]")

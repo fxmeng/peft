@@ -93,9 +93,7 @@ class PiSSAModel(BaseTuner):
 
     def __init__(self, model, config, adapter_name) -> None:
         super().__init__(model, config, adapter_name)
-        self.freeze_usv(adapter_name, config[adapter_name].freeze, config[adapter_name].negative_v)
-                
-                
+        self.freeze_usv(adapter_name, config[adapter_name].freeze)
 
     def _check_new_adapter_config(self, config: PiSSAConfig) -> None:
         """
@@ -148,12 +146,13 @@ class PiSSAModel(BaseTuner):
 
         kwargs = {
             "r": r,
-            "singular_value": pissa_config.singular_value,
-            "negative_v": pissa_config.negative_v,
+            "pissa_alpha": pissa_config.pissa_alpha,
             "pissa_dropout": pissa_config.pissa_dropout,
+            "singular_value": pissa_config.singular_value,
             "fan_in_fan_out": pissa_config.fan_in_fan_out,
             "init_pissa_weights": pissa_config.init_pissa_weights,
             "fsvd": pissa_config.fsvd,
+            "use_rspissa": pissa_config.use_rspissa,
             "loaded_in_8bit": getattr(self.model, "is_loaded_in_8bit", False),
             "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
         }
@@ -162,11 +161,12 @@ class PiSSAModel(BaseTuner):
             target.update_layer(
                 adapter_name,
                 r,
-                singular_value=pissa_config.singular_value,
-                negative_v=pissa_config.negative_v,
+                pissa_alpha=pissa_config.pissa_alpha,
                 pissa_dropout=pissa_config.pissa_dropout,
+                singular_value=pissa_config.singular_value,
                 init_pissa_weights=pissa_config.init_pissa_weights,
                 fsvd = pissa_config.fsvd,
+                use_rspissa=pissa_config.use_rspissa,
             )
         else:
             new_module = self._create_new_module(pissa_config, adapter_name, target, **kwargs)
@@ -826,19 +826,12 @@ class PiSSAModel(BaseTuner):
 
         return tensors_pissa
 
-    def freeze_usv(self, adapter_name="default", freeze=None, negative_v=False):
+    def freeze_usv(self, adapter_name="default", freeze=None):
         for module in self.modules():
             if isinstance(module, PiSSALayer):
                 if freeze is not None:
                     if adapter_name in module.pissa_U and adapter_name in module.pissa_V:
-                        if negative_v:
-                            freeze_U = "U" in freeze or "A" in freeze
-                            if "V" in freeze:
-                                warnings.warn(
-                                    f"When negative_v=True, V can't be freeze, else the output of the adapter will always be zero."
-                                )
-                            freeze_V = False
-                        elif "A" in freeze:
+                        if "A" in freeze:
                             freeze_U = module.pissa_U[adapter_name].weight.numel()>=module.pissa_V[adapter_name].weight.numel()
                             freeze_V = module.pissa_U[adapter_name].weight.numel()<module.pissa_V[adapter_name].weight.numel()
                         else:
@@ -849,6 +842,3 @@ class PiSSAModel(BaseTuner):
                         
                     if adapter_name in module.pissa_S:
                         module.pissa_S[adapter_name].requires_grad_(not "S" in freeze)
-                        
-                if adapter_name in module.pissa_negV:
-                    module.pissa_negV[adapter_name].requires_grad_(False)
