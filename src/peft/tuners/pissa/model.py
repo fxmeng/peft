@@ -153,6 +153,7 @@ class PiSSAModel(BaseTuner):
             "init_pissa_weights": pissa_config.init_pissa_weights,
             "fsvd": pissa_config.fsvd,
             "use_rspissa": pissa_config.use_rspissa,
+            "normalize_uv": pissa_config.normalize_uv,
             "loaded_in_8bit": getattr(self.model, "is_loaded_in_8bit", False),
             "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
         }
@@ -167,6 +168,7 @@ class PiSSAModel(BaseTuner):
                 init_pissa_weights=pissa_config.init_pissa_weights,
                 fsvd = pissa_config.fsvd,
                 use_rspissa=pissa_config.use_rspissa,
+                update_layer=pissa_config.update_layer,
             )
         else:
             new_module = self._create_new_module(pissa_config, adapter_name, target, **kwargs)
