@@ -169,6 +169,14 @@ class PiSSAConfig(PeftConfig):
             ),
         },
     )
+    normalize_uv : bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "normalize U and V during forward"
+            ),
+        },
+    )
     layers_to_transform: Optional[Union[list[int], int]] = field(
         default=None,
         metadata={

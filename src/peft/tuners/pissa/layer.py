@@ -29,7 +29,7 @@ class PiSSALayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
     adapter_layer_names = ("pissa_U", "pissa_S", "pissa_V", "pissa_embedding_U", "pissa_embedding_S", "pissa_embedding_V")
     # All names of other parameters that may contain adapter-related parameters
-    other_param_names = ("r", "pissa_alpha", "pissa_dropout", "fsvd", "singular_value")
+    other_param_names = ("r", "pissa_alpha", "pissa_dropout", "fsvd", "singular_value", "normalize_uv")
 
     def __init__(self, base_layer: nn.Module, **kwargs) -> None:
         self.base_layer = base_layer
@@ -37,6 +37,7 @@ class PiSSALayer(BaseTunerLayer):
         self.pissa_alpha = {}
         self.scaling = {}
         self.fsvd = {}
+        self.normalize_uv = {}
         self.pissa_dropout = nn.ModuleDict({})
         self.pissa_U = nn.ModuleDict({})
         self.pissa_S = nn.ParameterDict({})
@@ -122,6 +123,7 @@ class Linear(nn.Module, PiSSALayer):
         init_pissa_weights: Union[bool, str] = True,
         fsvd: int = None,
         use_rspissa: bool = False,
+        normalize_uv: bool = False,
         fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
         is_target_conv_1d_layer: bool = False,
         **kwargs,
@@ -140,11 +142,12 @@ class Linear(nn.Module, PiSSALayer):
             init_pissa_weights,
             fsvd=fsvd,
             use_rspissa=use_rspissa,
+            normalize_uv=normalize_uv,
         )
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
     def update_layer(
-        self, adapter_name, r, pissa_alpha, pissa_dropout, singular_value, init_pissa_weights, fsvd, use_rspissa, 
+        self, adapter_name, r, pissa_alpha, pissa_dropout, singular_value, init_pissa_weights, fsvd, use_rspissa, normalize_uv
     ):
         # This code works for linear layers, override for other layer types
         if r <= 0:
@@ -153,6 +156,9 @@ class Linear(nn.Module, PiSSALayer):
         self.r[adapter_name] = r
         self.pissa_alpha[adapter_name] = pissa_alpha
         self.fsvd[adapter_name] = fsvd
+        self.normalize_uv[adapter_name] = normalize_uv
+        if self.normalize_uv[adapter_name]:
+            assert singular_value in ["vector", "matrix"]
         if pissa_dropout > 0.0:
             pissa_dropout_layer = nn.Dropout(p=pissa_dropout)
         else:
@@ -289,6 +295,9 @@ class Linear(nn.Module, PiSSALayer):
             weight_V = weight_V.float()
 
         if adapter in self.pissa_S:
+            if self.normalize_uv[adapter]:
+                weight_U = weight_U / torch.linalg.norm(weight_U.detach(), dim=1).detach().unsqueeze(1)
+                weight_V = weight_V / torch.linalg.norm(weight_V.detach(), dim=0).detach()
             if len(weight_S.shape)==2:
                 before_V = weight_S @ weight_U
             else:
@@ -334,15 +343,19 @@ class Linear(nn.Module, PiSSALayer):
             # getting the sub-batch, passing it to PiSSA layers and updating the corresponding indices of the linear
             # layer output
             sub_batch = pissa_dropout(x[sub_batch_indices_list[i]].to(pissa_U.weight.dtype))
-            
+            after_U = pissa_U(sub_batch)
             if active_adapter in self.pissa_S.keys():
                 pissa_S = self.pissa_S[active_adapter]
+                if self.normalize_uv[active_adapter]:
+                    after_U /= torch.linalg.norm(pissa_U.weight.detach(), dim=1).detach()
                 if len(pissa_S.shape)==2:
-                    before_V = pissa_U(sub_batch) @ pissa_S
+                    before_V = after_U @ pissa_S
                 else:
-                    before_V = pissa_U(sub_batch) * pissa_S
+                    before_V = after_U * pissa_S
+                if self.normalize_uv[active_adapter]:
+                    before_V /= torch.linalg.norm(pissa_V.weight.detach(), dim=0).detach()
             else:
-                before_V = pissa_U(sub_batch)
+                before_V = after_U
                 
             pissa_output = pissa_V(before_V) * scaling
                 
@@ -373,14 +386,19 @@ class Linear(nn.Module, PiSSALayer):
                 pissa_V = self.pissa_V[active_adapter]
                 scaling = self.scaling[active_adapter]
                 x = pissa_dropout(x.to(pissa_U.weight.dtype))
+                after_U = pissa_U(x)
                 if active_adapter in self.pissa_S.keys():
                     pissa_S = self.pissa_S[active_adapter]
+                    if self.normalize_uv[active_adapter]:
+                        after_U /= torch.linalg.norm(pissa_U.weight.detach(), dim=1).detach()
                     if len(pissa_S.shape)==2:
-                        before_V = pissa_U(x) @ pissa_S
+                        before_V = after_U @ pissa_S
                     else:
-                        before_V = pissa_U(x) * pissa_S
+                        before_V = after_U * pissa_S
+                    if self.normalize_uv[active_adapter]:
+                        before_V /= torch.linalg.norm(pissa_V.weight.detach(), dim=0).detach()
                 else:
-                    before_V = pissa_U(x)
+                    before_V = after_U
                     
                 result = result + pissa_V(before_V) * scaling
             result = result.to(torch_result_dtype)
@@ -777,7 +795,7 @@ class Conv2d(nn.Module, PiSSALayer):
     ) -> torch.Tensor:
         # This is a special method that handles the case when users pass the argument `adapter_names`. This is an
         # extra argument that allows mixing different adapters in the same batch at inference time.
-        result = self.base_layer(self.pissa_dropout(x), *args, **kwargs)
+        result = self.base_layer(x, *args, **kwargs)
         torch_result_dtype = result.dtype
 
         unique_adapters = set(adapter_names)
@@ -798,7 +816,7 @@ class Conv2d(nn.Module, PiSSALayer):
             # getting the sub-batch, passing it to PiSSA layers and updating the corresponding indices of the linear
             # layer output
             sub_batch = x[sub_batch_indices_list[i]].to(pissa_U.weight.dtype)
-            after_U = pissa_U(sub_batch)
+            after_U = pissa_U(self.pissa_dropout(sub_batch))
             after_S = after_U * pissa_S[None,:,None,None]
             result[sub_batch_indices_list[i]] += pissa_V(after_S).to(torch_result_dtype)
 
@@ -817,7 +835,7 @@ class Conv2d(nn.Module, PiSSALayer):
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else:
-            result = self.base_layer(self.pissa_dropout(x), *args, **kwargs)
+            result = self.base_layer(x, *args, **kwargs)
             torch_result_dtype = result.dtype
 
             for active_adapter in self.active_adapters:
@@ -827,7 +845,7 @@ class Conv2d(nn.Module, PiSSALayer):
                 pissa_S = self.pissa_S[active_adapter]
                 pissa_V = self.pissa_V[active_adapter]
                 x = x.to(pissa_U.weight.dtype)
-                after_U = pissa_U(x)
+                after_U = pissa_U(self.pissa_dropout(x))
                 after_S = after_U * pissa_S[None,:,None,None]
                 result = result + pissa_V(after_S)
 
