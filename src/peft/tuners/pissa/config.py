@@ -37,10 +37,6 @@ class PiSSAConfig(PeftConfig):
             "`to_uv`: will merge the square root of S to both U and V."
             "`vector`: preserve the singular value as a vector for finetuning."
             "`matrix`: preserve the singular value in matrix format for finetuning."
-        freeze: Optional[str]:
-            freeze "`USVA`" layers.
-            "if the input contain `A`, will freeze one of U and V which has more number of parameters."
-            "elif the input contain `U` or `V`, will freeze the corresponding components."
         target_modules (`Optional[Union[List[str], str]]`):
             The names of the modules to apply the adapter to. If this is specified, only the modules with the specified
             names will be replaced. When passing a string, a regex match will be performed. When passing a list of
@@ -166,14 +162,6 @@ class PiSSAConfig(PeftConfig):
         metadata={
             "help": (
                 "Fast-SVD-based PiSSA initialization, where [fsvd] indicates the number of subspace iterations to perform fsvd, and must be a nonnegative integer."
-            ),
-        },
-    )
-    normalize_uv : bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "normalize U and V during forward"
             ),
         },
     )

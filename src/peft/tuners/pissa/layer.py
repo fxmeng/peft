@@ -29,7 +29,7 @@ class PiSSALayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
     adapter_layer_names = ("pissa_U", "pissa_S", "pissa_V", "pissa_embedding_U", "pissa_embedding_S", "pissa_embedding_V")
     # All names of other parameters that may contain adapter-related parameters
-    other_param_names = ("r", "pissa_alpha", "pissa_dropout", "fsvd", "singular_value", "normalize_uv")
+    other_param_names = ("r", "pissa_alpha", "pissa_dropout", "fsvd", "singular_value")
 
     def __init__(self, base_layer: nn.Module, **kwargs) -> None:
         self.base_layer = base_layer
@@ -37,7 +37,6 @@ class PiSSALayer(BaseTunerLayer):
         self.pissa_alpha = {}
         self.scaling = {}
         self.fsvd = {}
-        self.normalize_uv = {}
         self.pissa_dropout = nn.ModuleDict({})
         self.pissa_U = nn.ModuleDict({})
         self.pissa_S = nn.ParameterDict({})
@@ -123,7 +122,6 @@ class Linear(nn.Module, PiSSALayer):
         init_pissa_weights: Union[bool, str] = True,
         fsvd: int = None,
         use_rspissa: bool = False,
-        normalize_uv: bool = False,
         fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
         is_target_conv_1d_layer: bool = False,
         **kwargs,
@@ -142,12 +140,11 @@ class Linear(nn.Module, PiSSALayer):
             init_pissa_weights,
             fsvd=fsvd,
             use_rspissa=use_rspissa,
-            normalize_uv=normalize_uv,
         )
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
     def update_layer(
-        self, adapter_name, r, pissa_alpha, pissa_dropout, singular_value, init_pissa_weights, fsvd, use_rspissa, normalize_uv
+        self, adapter_name, r, pissa_alpha, pissa_dropout, singular_value, init_pissa_weights, fsvd, use_rspissa
     ):
         # This code works for linear layers, override for other layer types
         if r <= 0:
@@ -156,9 +153,6 @@ class Linear(nn.Module, PiSSALayer):
         self.r[adapter_name] = r
         self.pissa_alpha[adapter_name] = pissa_alpha
         self.fsvd[adapter_name] = fsvd
-        self.normalize_uv[adapter_name] = normalize_uv
-        if self.normalize_uv[adapter_name]:
-            assert singular_value in ["vector", "matrix"]
         if pissa_dropout > 0.0:
             pissa_dropout_layer = nn.Dropout(p=pissa_dropout)
         else:
@@ -295,9 +289,6 @@ class Linear(nn.Module, PiSSALayer):
             weight_V = weight_V.float()
 
         if adapter in self.pissa_S:
-            if self.normalize_uv[adapter]:
-                weight_U = weight_U / torch.linalg.norm(weight_U.detach(), dim=1).detach().unsqueeze(1)
-                weight_V = weight_V / torch.linalg.norm(weight_V.detach(), dim=0).detach()
             if len(weight_S.shape)==2:
                 before_V = weight_S @ weight_U
             else:
@@ -346,14 +337,10 @@ class Linear(nn.Module, PiSSALayer):
             after_U = pissa_U(sub_batch)
             if active_adapter in self.pissa_S.keys():
                 pissa_S = self.pissa_S[active_adapter]
-                if self.normalize_uv[active_adapter]:
-                    after_U /= torch.linalg.norm(pissa_U.weight.detach(), dim=1).detach()
                 if len(pissa_S.shape)==2:
                     before_V = after_U @ pissa_S
                 else:
                     before_V = after_U * pissa_S
-                if self.normalize_uv[active_adapter]:
-                    before_V /= torch.linalg.norm(pissa_V.weight.detach(), dim=0).detach()
             else:
                 before_V = after_U
                 
@@ -389,14 +376,10 @@ class Linear(nn.Module, PiSSALayer):
                 after_U = pissa_U(x)
                 if active_adapter in self.pissa_S.keys():
                     pissa_S = self.pissa_S[active_adapter]
-                    if self.normalize_uv[active_adapter]:
-                        after_U /= torch.linalg.norm(pissa_U.weight.detach(), dim=1).detach()
                     if len(pissa_S.shape)==2:
                         before_V = after_U @ pissa_S
                     else:
                         before_V = after_U * pissa_S
-                    if self.normalize_uv[active_adapter]:
-                        before_V /= torch.linalg.norm(pissa_V.weight.detach(), dim=0).detach()
                 else:
                     before_V = after_U
                     

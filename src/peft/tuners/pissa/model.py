@@ -93,7 +93,6 @@ class PiSSAModel(BaseTuner):
 
     def __init__(self, model, config, adapter_name) -> None:
         super().__init__(model, config, adapter_name)
-        self.freeze_usv(adapter_name, config[adapter_name].freeze)
 
     def _check_new_adapter_config(self, config: PiSSAConfig) -> None:
         """
@@ -153,7 +152,6 @@ class PiSSAModel(BaseTuner):
             "init_pissa_weights": pissa_config.init_pissa_weights,
             "fsvd": pissa_config.fsvd,
             "use_rspissa": pissa_config.use_rspissa,
-            "normalize_uv": pissa_config.normalize_uv,
             "loaded_in_8bit": getattr(self.model, "is_loaded_in_8bit", False),
             "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
         }
@@ -827,20 +825,3 @@ class PiSSAModel(BaseTuner):
                 )
 
         return tensors_pissa
-
-    def freeze_usv(self, adapter_name="default", freeze=None):
-        for module in self.modules():
-            if isinstance(module, PiSSALayer):
-                if freeze is not None:
-                    if adapter_name in module.pissa_U and adapter_name in module.pissa_V:
-                        if "A" in freeze:
-                            freeze_U = module.pissa_U[adapter_name].weight.numel()>=module.pissa_V[adapter_name].weight.numel()
-                            freeze_V = module.pissa_U[adapter_name].weight.numel()<module.pissa_V[adapter_name].weight.numel()
-                        else:
-                            freeze_U = "U" in freeze
-                            freeze_V = "V" in freeze
-                        module.pissa_U[adapter_name].requires_grad_(not freeze_U)
-                        module.pissa_V[adapter_name].requires_grad_(not freeze_V)
-                        
-                    if adapter_name in module.pissa_S:
-                        module.pissa_S[adapter_name].requires_grad_(not "S" in freeze)
