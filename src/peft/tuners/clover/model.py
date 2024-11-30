@@ -42,8 +42,8 @@ from peft.utils import (
 from peft.utils.merge_utils import dare_linear, dare_ties, magnitude_prune, task_arithmetic, ties
 from peft.utils.other import get_pattern_key
 
-from config import CloverConfig
-from layer import CloverLayer, dispatch_default
+from .config import CloverConfig
+from .layer import CloverLayer, dispatch_default
 
 
 def _adapter_names_pre_forward_hook(target, args, kwargs, adapter_names):
@@ -154,14 +154,14 @@ class CloverModel(BaseTuner):
         
     @staticmethod
     def _prepare_adapter_config(peft_config, model_config):
-        if peft_config.target_modules is None:
+        if peft_config.head_in_or_head_out is None:
             if model_config["model_type"] not in TRANSFORMERS_MODELS_TO_CLOVER_TARGET_MODULES_MAPPING:
                 raise ValueError("Please specify `target_modules` in `peft_config`")
-            peft_config.target_modules = set(
-                TRANSFORMERS_MODELS_TO_CLOVER_TARGET_MODULES_MAPPING[model_config["model_type"]]
-            )
-            if peft_config.head_dim is None:
-                peft_config.head_dim = model_config["hidden_size"]//model_config["num_attention_heads"]
+            peft_config.head_in_or_head_out = TRANSFORMERS_MODELS_TO_CLOVER_TARGET_MODULES_MAPPING[model_config["model_type"]]
+        if peft_config.target_modules is None:
+            peft_config.target_modules = set(peft_config.head_in_or_head_out.keys())
+        if peft_config.head_dim is None:
+            peft_config.head_dim = model_config["hidden_size"] // model_config["num_attention_heads"]
         return peft_config
     
     @staticmethod
@@ -282,12 +282,12 @@ class CloverModel(BaseTuner):
         
         # avoid eager bnb import
         if is_bnb_available():
-            from bnb import dispatch_bnb_8bit
+            from .bnb import dispatch_bnb_8bit
 
             dispatchers.append(dispatch_bnb_8bit)
 
         if is_bnb_4bit_available():
-            from bnb import dispatch_bnb_4bit
+            from .bnb import dispatch_bnb_4bit
 
             dispatchers.append(dispatch_bnb_4bit)
 

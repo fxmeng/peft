@@ -24,7 +24,7 @@ from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 from peft.utils.integrations import dequantize_bnb_weight
 from peft.utils.other import transpose
 
-from layer import CloverLayer
+from .layer import CloverLayer
 
 
 if is_bnb_available():
