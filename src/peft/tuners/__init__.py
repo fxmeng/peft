@@ -27,6 +27,7 @@ from .lora import (
     get_eva_state_dict,
     initialize_lora_eva_weights,
 )
+from .clover import CloverConfig, CloverModel
 from .loha import LoHaConfig, LoHaModel
 from .lokr import LoKrConfig, LoKrModel
 from .ia3 import IA3Config, IA3Model

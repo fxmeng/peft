@@ -133,6 +133,9 @@ def get_peft_model_state_dict(
         else:
             raise NotImplementedError
 
+    elif config.peft_type == PeftType.CLOVER:
+        to_return = {k: state_dict[k] for k in state_dict if "clover_" in k}
+        
     elif config.peft_type == PeftType.LOHA:
         to_return = {k: state_dict[k] for k in state_dict if "hada_" in k}
 
