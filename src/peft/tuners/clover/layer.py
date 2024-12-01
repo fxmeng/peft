@@ -118,34 +118,19 @@ class Linear(nn.Module, CloverLayer):
         dtype = self.base_layer.weight.dtype
         base_weight = self.base_layer.weight.data # (out_dim, in_dim)
         if self.head_in[adapter_name]:
-            base_weight = base_weight.view(-1, self.num_head[adapter_name], self.head_dim[adapter_name]) # (out_dim, num_heads, head_dim)
-            weight_R = []
-            for h in range(self.num_head[adapter_name]):
-                Q, R = torch.linalg.qr(base_weight[:,h].to(torch.float32)) # Q(out_dim, head_dim), R(head_dim, head_dim)
-                base_weight[:,h] = Q # (out_dim, head_dim)
-                weight_R.append(R.T)
-                
-            self.clover_R[adapter_name].data = torch.stack(weight_R).to(dtype) # (num_heads, head_dim, head_dim)
-            self.base_layer.weight.data = base_weight.reshape(-1, self.num_head[adapter_name]*self.head_dim[adapter_name]).contiguous()
-            
+            base_weight = base_weight.view(-1, self.num_head[adapter_name], self.head_dim[adapter_name]).transpose(0,1) # (num_heads, out_dim, head_dim)
+            Q, R = torch.linalg.qr(base_weight.to(torch.float32)) # Q(num_heads, out_dim, head_dim), R(num_heads, head_dim, head_dim)
+            self.clover_R[adapter_name].data = R.transpose(1,2).to(dtype).contiguous()
+            self.base_layer.weight.data = Q.transpose(0,1).reshape(-1, self.num_head[adapter_name]*self.head_dim[adapter_name]).to(dtype).contiguous()
         else:        
             if self.base_layer.bias is not None:
                 base_bias = self.base_layer.bias.data.unsqueeze(1) # (out_dim, 1)
                 base_weight = torch.cat([base_weight, base_bias],dim=1)  # (out_dim, in_dim+1)
                 
-            base_weight = base_weight.view(self.num_head[adapter_name], self.head_dim[adapter_name], -1) # (num_heads, head_dim, in_dim) or (num_heads, head_dim, in_dim+1)
-            weight_R = []
-            for h in range(self.num_head[adapter_name]):
-                Q, R = torch.linalg.qr(base_weight[h].T.to(torch.float32)) # Q(in_dim, head_dim), R(head_dim, head_dim)
-                base_weight[h] = Q.T # (head_dim, in_dim) or (head_dim, in_dim+1)
-                weight_R.append(R)
-                
-            self.clover_R[adapter_name].data = torch.stack(weight_R).to(dtype) # (num_heads, head_dim, head_dim)
-            if self.base_layer.bias is not None:
-                self.base_layer.bias.data = base_weight[:,:,-1].reshape(-1).contiguous().to(dtype) # (out_dim, )
-                base_weight = base_weight[:,:,:-1].to(dtype) # (num_heads, head_dim, in_dim)
-
-            self.base_layer.weight.data = base_weight.reshape(self.num_head[adapter_name]*self.head_dim[adapter_name], -1).contiguous()
+            base_weight = base_weight.view(self.num_head[adapter_name], self.head_dim[adapter_name], -1).transpose(1,2)  # (num_heads, in_dim, head_dim) or (num_heads, in_dim+1, head_dim)
+            Q, R = torch.linalg.qr(base_weight.to(torch.float32)) # Q(num_heads, in_dim, head_dim), R(num_heads, head_dim, head_dim)
+            self.clover_R[adapter_name].data = R.to(dtype).contiguous()
+            self.base_layer.weight.data = Q.transpose(1,2).reshape(self.num_head[adapter_name]*self.head_dim[adapter_name], -1).to(dtype).contiguous()
 
     def absorb_decompose_init(adapter_name):
         pass
