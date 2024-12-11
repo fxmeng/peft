@@ -154,12 +154,12 @@ class CloverModel(BaseTuner):
         
     @staticmethod
     def _prepare_adapter_config(peft_config, model_config):
-        if peft_config.head_in_or_head_out is None:
+        if peft_config.target_module_config is None:
             if model_config["model_type"] not in TRANSFORMERS_MODELS_TO_CLOVER_TARGET_MODULES_MAPPING:
                 raise ValueError("Please specify `target_modules` in `peft_config`")
-            peft_config.head_in_or_head_out = TRANSFORMERS_MODELS_TO_CLOVER_TARGET_MODULES_MAPPING[model_config["model_type"]]
+            peft_config.target_module_config = TRANSFORMERS_MODELS_TO_CLOVER_TARGET_MODULES_MAPPING[model_config["model_type"]]
         if peft_config.target_modules is None:
-            peft_config.target_modules = set(peft_config.head_in_or_head_out.keys())
+            peft_config.target_modules = set(peft_config.target_module_config.keys())
         if peft_config.head_dim is None:
             peft_config.head_dim = model_config["hidden_size"] // model_config["num_attention_heads"]
         return peft_config
@@ -188,12 +188,14 @@ class CloverModel(BaseTuner):
         parent,
         current_key,
     ):
-        head_in = clover_config.head_in_or_head_out[target_name]=='in'
+        decomp = clover_config.target_module_config[target_name][0]=='decomp'
+        cross_head = clover_config.target_module_config[target_name][1]=='cross_head'
         if current_key is None:
             raise ValueError("Current Key shouldn't be `None`")
         kwargs = {
             "head_dim": clover_config.head_dim,
-            "head_in": head_in,
+            "decomp": decomp,
+            "cross_head": cross_head,
             "init_clover_weights": clover_config.init_clover_weights,
             "loaded_in_8bit": getattr(self.model, "is_loaded_in_8bit", False),
             "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
@@ -203,7 +205,8 @@ class CloverModel(BaseTuner):
             target.update_layer(
                 adapter_name,
                 clover_config.head_dim,
-                head_in,
+                decomp,
+                cross_head,
                 init_clover_weights=clover_config.init_clover_weights,
             )
         else:

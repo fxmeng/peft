@@ -121,18 +121,15 @@ TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING = {
 }
 
 TRANSFORMERS_MODELS_TO_CLOVER_TARGET_MODULES_MAPPING = {
-    "bart": {"q_proj":"out", "k_proj":"out", "v_proj":"out", "o_proj":"in"},
-    "opt": {"q_proj":"out", "k_proj":"out", "v_proj":"out", "o_proj":"in"},
-    "gptj": {"q_proj":"out", "k_proj":"out", "v_proj":"out", "o_proj":"in"},
-    "gpt_neo": {"q_proj":"out", "k_proj":"out", "v_proj":"out", "o_proj":"in"},
-    "mistral": {"q_proj":"out", "k_proj":"out", "v_proj":"out", "o_proj":"in"},
-    "mixtral": {"q_proj":"out", "k_proj":"out", "v_proj":"out", "o_proj":"in"},
-    "stablelm": {"q_proj":"out", "k_proj":"out", "v_proj":"out", "o_proj":"in"},
-    "llama": {"q_proj":"out", "k_proj":"out", "v_proj":"out", "o_proj":"in"},
-    "gemma": {"q_proj":"out", "k_proj":"out", "v_proj":"out", "o_proj":"in"},
-    "gemma2": {"q_proj":"out", "k_proj":"out", "v_proj":"out", "o_proj":"in"},
-    "qwen2": {"q_proj":"out", "k_proj":"out", "v_proj":"out", "o_proj":"in"},
-    "phi": {"q_proj":"out", "k_proj":"out", "v_proj":"out", "o_proj":"in"},
+    "llama": {
+        "q_proj":("comp","cross_head"), 
+        "k_proj":("comp","in_head"), 
+        "v_proj":("comp","in_head"), 
+        "o_proj":("decomp","cross_head"), 
+        "gate_proj":("comp", "in_head"), 
+        "up_proj":("comp", "in_head"), 
+        "down_proj":("decomp","cross_head"), 
+    },
 }
 
 TRANSFORMERS_MODELS_TO_IA3_TARGET_MODULES_MAPPING = {

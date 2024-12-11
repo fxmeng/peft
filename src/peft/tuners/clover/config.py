@@ -71,7 +71,7 @@ class CloverConfig(PeftConfig):
             ),
         },
     )
-    head_in_or_head_out: Optional[dict] = field(
+    target_module_config: Optional[dict] = field(
         default=None,
         metadata={
             "help": (
