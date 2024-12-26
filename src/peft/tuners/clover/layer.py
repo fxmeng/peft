@@ -71,6 +71,7 @@ class Linear(nn.Module, CloverLayer):
         base_layer,
         adapter_name: str = 'default',
         head_dim: int = 128,
+        num_head: int = 32,
         decomp: bool = False,
         cross_head: bool = False,
         init_clover_weights: str = 'eye', # Choices: ['eye','qr','absorb-decompose']
@@ -82,28 +83,24 @@ class Linear(nn.Module, CloverLayer):
         self.update_layer(
             adapter_name,
             head_dim,
+            num_head,
             decomp,
             cross_head,
             init_clover_weights=init_clover_weights,
         )
 
     def update_layer(
-        self, adapter_name, head_dim, decomp, cross_head, init_clover_weights
+        self, adapter_name, head_dim, num_head, decomp, cross_head, init_clover_weights
     ):
         self.head_dim[adapter_name] = head_dim
+        self.num_head[adapter_name] = num_head
         self.decomp[adapter_name] = decomp
         self.cross_head[adapter_name] = cross_head
         # Actual trainable parameters
-        if decomp:
-            assert self.in_features % head_dim == 0
-            self.num_head[adapter_name] = self.in_features // head_dim
-        else:
-            assert self.out_features % head_dim == 0
-            self.num_head[adapter_name] = self.out_features // head_dim
         if cross_head:
-            weight_R = torch.randn((head_dim, self.num_head[adapter_name], self.num_head[adapter_name]))
+            weight_R = torch.randn((self.in_features//num_head if decomp else self.out_features//num_head, num_head, num_head))
         else:
-            weight_R = torch.randn((self.num_head[adapter_name], head_dim, head_dim))
+            weight_R = torch.randn((self.in_features//head_dim if decomp else self.out_features//head_dim, head_dim, head_dim))
         self.clover_R[adapter_name] = nn.Parameter(weight_R)
 
         # for inits that require access to the base weight, use gather_param_ctx so that the weight is gathered when using DeepSpeed
@@ -124,28 +121,33 @@ class Linear(nn.Module, CloverLayer):
         dtype = self.base_layer.weight.dtype
         base_weight = self.base_layer.weight.data # (out_dim, in_dim)
         if self.decomp[adapter_name]:
-            base_weight = base_weight.view(-1, self.num_head[adapter_name], self.head_dim[adapter_name]) # (out_dim, num_heads, head_dim)
             if self.cross_head[adapter_name]:
+                base_weight = base_weight.view(self.out_features, self.num_head[adapter_name], -1) # (out_dim, num_heads, head_dim)
                 base_weight = base_weight.permute(2,0,1) # (head_dim, out_dim, num_heads)
                 Q, R = torch.linalg.qr(base_weight.to(torch.float32)) # Q(head_dim, out_dim, num_heads), R(head_dim, num_heads, num_heads)
                 Q = Q.permute(1,2,0) # (out_dim, num_heads, head_dim)
             else:
+                base_weight = base_weight.view(self.out_features, -1, self.head_dim[adapter_name]) # (out_dim, num_heads, head_dim)
                 base_weight = base_weight.transpose(0,1) # (num_heads, out_dim, head_dim)
                 Q, R = torch.linalg.qr(base_weight.to(torch.float32)) # Q(num_heads, out_dim, head_dim), R(num_heads, head_dim, head_dim)
                 Q = Q.transpose(0,1) # (out_dim, num_heads, head_dim)
             self.clover_R[adapter_name].data = R.transpose(1,2).to(dtype).contiguous()
-            self.base_layer.weight.data = Q.reshape(-1, self.num_head[adapter_name]*self.head_dim[adapter_name]).to(dtype).contiguous()
+            self.base_layer.weight.data = Q.reshape(self.out_features, -1).to(dtype).contiguous()
         else:
             if self.base_layer.bias is not None:
                 base_bias = self.base_layer.bias.data.unsqueeze(1) # (out_dim, 1)
                 base_weight = torch.cat([base_weight, base_bias],dim=1)  # (out_dim, in_dim+1)
+                in_features = self.in_features + 1
+            else:
+                in_features = self.in_features
                 
-            base_weight = base_weight.view(self.num_head[adapter_name], self.head_dim[adapter_name], -1) # (num_heads, head_dim, in_dim)
             if self.cross_head[adapter_name]:
+                base_weight = base_weight.view(self.num_head[adapter_name], -1, in_features) # (num_heads, head_dim, in_dim)
                 base_weight = base_weight.permute(1,2,0)  # (head_dim, in_dim, num_heads) or (head_dim, in_dim+1, num_heads)
                 Q, R = torch.linalg.qr(base_weight.to(torch.float32)) # Q(head_dim, in_dim+1, num_heads), R(head_dim, num_heads, num_heads)
                 Q = Q.permute(2,0,1) # (num_heads, head_dim, in_dim) or (num_heads, head_dim, in_dim+1)
             else:
+                base_weight = base_weight.view(-1, self.head_dim[adapter_name], in_features) # (num_heads, head_dim, in_dim)
                 base_weight = base_weight.transpose(1,2)  # (num_heads, in_dim, head_dim) or (num_heads, in_dim+1, head_dim)
                 Q, R = torch.linalg.qr(base_weight.to(torch.float32)) # Q(num_heads, in_dim+1, head_dim), R(num_heads, head_dim, head_dim)
                 Q = Q.transpose(1,2)# (num_heads, head_dim, in_dim) or (num_heads, head_dim, in_dim+1)
@@ -154,7 +156,7 @@ class Linear(nn.Module, CloverLayer):
             if self.base_layer.bias is not None:
                 self.base_layer.bias.data = Q[:,:,-1].reshape(-1).to(dtype).contiguous()
                 Q = Q[:,:,:-1] # (num_heads, head_dim, in_dim)
-            self.base_layer.weight.data = Q.reshape(self.num_head[adapter_name]*self.head_dim[adapter_name], -1).to(dtype).contiguous()
+            self.base_layer.weight.data = Q.reshape(-1, self.in_features).to(dtype).contiguous()
     
     def merge(self, safe_merge: bool = True, adapter_names: Optional[list[str]] = None) -> None:
         """
@@ -182,20 +184,25 @@ class Linear(nn.Module, CloverLayer):
                 base_weights = base_layer.weight.data.clone() # (out_dim, in_dim)
                 weight_R = self.clover_R[active_adapter].data #(num_head, head_dim, head_dim) or (head_dim, num_head, num_head)
                 if self.decomp[active_adapter]:
-                    base_weights = base_weights.view(self.out_features, self.num_head[active_adapter], self.head_dim[active_adapter])
                     if self.cross_head[active_adapter]:
+                        base_weights = base_weights.view(self.out_features, self.num_head[active_adapter], -1)
                         base_weights = torch.einsum("ohd,dlh->old", base_weights, weight_R) 
                     else:
+                        base_weights = base_weights.view(self.out_features, -1, self.head_dim[active_adapter])
                         base_weights = torch.einsum("ohd,hed->ohe", base_weights, weight_R) 
                 else:
                     if base_layer.bias is not None:
                         base_bias = base_layer.bias.data.clone().unsqueeze(1) # (out_dim, 1)
                         base_weights = torch.cat([base_weights, base_bias], dim=1)
+                        in_features = self.in_features + 1
+                    else:
+                        in_features = self.in_features
                         
-                    base_weights = base_weights.view(self.num_head[active_adapter], self.head_dim[active_adapter], -1)
                     if self.cross_head[active_adapter]:
+                        base_weights = base_weights.view(self.num_head[active_adapter], -1, in_features)
                         base_weights = torch.einsum("hdi,dhl->ldi", base_weights, weight_R)
                     else:
+                        base_weights = base_weights.view(-1, self.head_dim[active_adapter], in_features)
                         base_weights = torch.einsum("hdi,hde->hei", base_weights, weight_R)
                 base_weights = base_weights.reshape(self.out_features, -1).contiguous()
                 if not torch.isfinite(base_weights).all():
@@ -211,12 +218,13 @@ class Linear(nn.Module, CloverLayer):
 
     def rotation(self, result, clover_R, num_head, head_dim, cross_head=False):
         bsz, seq, _ = result.shape
-        result = result.view(bsz, seq, num_head, head_dim)
         if cross_head:
+            result = result.view(bsz, seq, num_head, -1)
             result = torch.einsum("bshd,dhi->bsid", result, clover_R)
         else:
+            result = result.view(bsz, seq, -1, head_dim)
             result = torch.einsum("bshd,hde->bshe", result, clover_R)
-        result = result.reshape(bsz, seq, num_head*head_dim).contiguous() 
+        result = result.reshape(bsz, seq, -1).contiguous() 
         return result
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:

@@ -85,6 +85,13 @@ class CloverConfig(PeftConfig):
             ),
         },
     )
+    num_head: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+            ),
+        },
+    )
     exclude_modules: Optional[Union[list[str], str]] = field(
         default=None,
         metadata={"help": "List of module names or regex expression of the module names to exclude from Clover."},

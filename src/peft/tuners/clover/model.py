@@ -162,6 +162,8 @@ class CloverModel(BaseTuner):
             peft_config.target_modules = set(peft_config.target_module_config.keys())
         if peft_config.head_dim is None:
             peft_config.head_dim = model_config["hidden_size"] // model_config["num_attention_heads"]
+        if peft_config.num_head is None:
+            peft_config.num_head = model_config["num_attention_heads"]
         return peft_config
     
     @staticmethod
@@ -194,6 +196,7 @@ class CloverModel(BaseTuner):
             raise ValueError("Current Key shouldn't be `None`")
         kwargs = {
             "head_dim": clover_config.head_dim,
+            "num_head": clover_config.num_head,
             "decomp": decomp,
             "cross_head": cross_head,
             "init_clover_weights": clover_config.init_clover_weights,
@@ -205,6 +208,7 @@ class CloverModel(BaseTuner):
             target.update_layer(
                 adapter_name,
                 clover_config.head_dim,
+                clover_config.num_head,
                 decomp,
                 cross_head,
                 init_clover_weights=clover_config.init_clover_weights,
