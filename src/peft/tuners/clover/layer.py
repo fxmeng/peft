@@ -21,7 +21,7 @@ from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 
 class CloverLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
-    adapter_layer_names = ("clover_R",)
+    adapter_layer_names = ("clover_S", "clover_V")
 
     def __init__(self, base_layer: nn.Module, **kwargs) -> None:
         self.base_layer = base_layer
@@ -29,7 +29,8 @@ class CloverLayer(BaseTunerLayer):
         self.head_dim = {}
         self.decomp = {}
         self.cross_head = {}
-        self.clover_R = nn.ParameterDict({})
+        self.clover_S = nn.ParameterDict({})
+        self.clover_V = nn.ParameterDict({})
         # Mark the weight as unmerged
         self._disable_adapters = False
         self.merged_adapters = []
@@ -97,42 +98,47 @@ class Linear(nn.Module, CloverLayer):
         self.decomp[adapter_name] = decomp
         self.cross_head[adapter_name] = cross_head
         # Actual trainable parameters
+        weight_S = torch.randn((self.in_features if decomp else self.out_features))
+        self.clover_S[adapter_name] = nn.Parameter(weight_S)
         if cross_head:
-            weight_R = torch.randn((self.in_features//num_head if decomp else self.out_features//num_head, num_head, num_head))
+            weight_V = torch.randn((self.in_features//num_head if decomp else self.out_features//num_head, num_head, num_head))
         else:
-            weight_R = torch.randn((self.in_features//head_dim if decomp else self.out_features//head_dim, head_dim, head_dim))
-        self.clover_R[adapter_name] = nn.Parameter(weight_R)
+            weight_V = torch.randn((self.in_features//head_dim if decomp else self.out_features//head_dim, head_dim, head_dim))
+        self.clover_V[adapter_name] = nn.Parameter(weight_V)
 
         # for inits that require access to the base weight, use gather_param_ctx so that the weight is gathered when using DeepSpeed
-        if init_clover_weights == "qr":
-            self.qr_decompose_init(adapter_name)
+        if init_clover_weights == 'svd':
+            self.orthonormal_decompose_init(adapter_name)
         else:
             self.reset_clover_parameters(adapter_name)
 
         self.set_adapter(self.active_adapters)
 
     def reset_clover_parameters(self, adapter_name):
-        if adapter_name in self.clover_R.keys():
-            n,d,_ = self.clover_R[adapter_name].data.shape
-            weight_R = torch.eye(d).unsqueeze(0).repeat(n, 1, 1)
-            self.clover_R[adapter_name].data = weight_R
-
-    def qr_decompose_init(self, adapter_name):
+        if adapter_name in self.clover_V.keys():
+            torch.nn.init.ones_(self.clover_S[adapter_name].data)
+            n,d,_ = self.clover_V[adapter_name].data.shape
+            weight_V = torch.eye(d).unsqueeze(0).repeat(n, 1, 1)
+            self.clover_V[adapter_name].data = weight_V
+ 
+    def orthonormal_decompose_init(self, adapter_name):
         dtype = self.base_layer.weight.dtype
         base_weight = self.base_layer.weight.data # (out_dim, in_dim)
         if self.decomp[adapter_name]:
             if self.cross_head[adapter_name]:
                 base_weight = base_weight.view(self.out_features, self.num_head[adapter_name], -1) # (out_dim, num_heads, head_dim)
                 base_weight = base_weight.permute(2,0,1) # (head_dim, out_dim, num_heads)
-                Q, R = torch.linalg.qr(base_weight.to(torch.float32)) # Q(head_dim, out_dim, num_heads), R(head_dim, num_heads, num_heads)
-                Q = Q.permute(1,2,0) # (out_dim, num_heads, head_dim)
+                U,S,V = torch.linalg.svd(base_weight.to(torch.float32), full_matrices=False) # U(head_dim, out_dim, num_heads), S(head_dim, num_heads), V(head_dim, num_heads, num_heads)
+                U = U.permute(1,2,0) # (out_dim, num_heads, head_dim)
+                S = S.T # S(num_heads, head_dim)
             else:
                 base_weight = base_weight.view(self.out_features, -1, self.head_dim[adapter_name]) # (out_dim, num_heads, head_dim)
                 base_weight = base_weight.transpose(0,1) # (num_heads, out_dim, head_dim)
-                Q, R = torch.linalg.qr(base_weight.to(torch.float32)) # Q(num_heads, out_dim, head_dim), R(num_heads, head_dim, head_dim)
-                Q = Q.transpose(0,1) # (out_dim, num_heads, head_dim)
-            self.clover_R[adapter_name].data = R.transpose(1,2).to(dtype).contiguous()
-            self.base_layer.weight.data = Q.reshape(self.out_features, -1).to(dtype).contiguous()
+                U,S,V = torch.linalg.svd(base_weight.to(torch.float32), full_matrices=False) # U(num_heads, out_dim, head_dim), S(num_heads, head_dim), V(num_heads, head_dim, head_dim)
+                U = U.transpose(0,1) # (out_dim, num_heads, head_dim)
+            self.base_layer.weight.data = U.reshape(self.out_features, -1).to(dtype).contiguous()
+            self.clover_S[adapter_name].data = S.reshape(-1).to(dtype).contiguous()
+            self.clover_V[adapter_name].data = V.transpose(1,2).to(dtype).contiguous()
         else:
             if self.base_layer.bias is not None:
                 base_bias = self.base_layer.bias.data.unsqueeze(1) # (out_dim, 1)
@@ -144,19 +150,21 @@ class Linear(nn.Module, CloverLayer):
             if self.cross_head[adapter_name]:
                 base_weight = base_weight.view(self.num_head[adapter_name], -1, in_features) # (num_heads, head_dim, in_dim)
                 base_weight = base_weight.permute(1,2,0)  # (head_dim, in_dim, num_heads) or (head_dim, in_dim+1, num_heads)
-                Q, R = torch.linalg.qr(base_weight.to(torch.float32)) # Q(head_dim, in_dim+1, num_heads), R(head_dim, num_heads, num_heads)
-                Q = Q.permute(2,0,1) # (num_heads, head_dim, in_dim) or (num_heads, head_dim, in_dim+1)
+                U,S,V = torch.linalg.svd(base_weight.to(torch.float32), full_matrices=False) # U(head_dim, in_dim+1, num_heads), S(head_dim, num_heads), V(head_dim, num_heads, num_heads)
+                U = U.permute(2,0,1) # (num_heads, head_dim, in_dim) or (num_heads, head_dim, in_dim+1)
+                S = S.T # S(num_heads, head_dim)
             else:
                 base_weight = base_weight.view(-1, self.head_dim[adapter_name], in_features) # (num_heads, head_dim, in_dim)
                 base_weight = base_weight.transpose(1,2)  # (num_heads, in_dim, head_dim) or (num_heads, in_dim+1, head_dim)
-                Q, R = torch.linalg.qr(base_weight.to(torch.float32)) # Q(num_heads, in_dim+1, head_dim), R(num_heads, head_dim, head_dim)
-                Q = Q.transpose(1,2)# (num_heads, head_dim, in_dim) or (num_heads, head_dim, in_dim+1)
+                U,S,V = torch.linalg.svd(base_weight.to(torch.float32), full_matrices=False) # U(num_heads, in_dim+1, head_dim), S(num_heads, head_dim), V(num_heads, head_dim, head_dim)
+                U = U.transpose(1,2)# (num_heads, head_dim, in_dim) or (num_heads, head_dim, in_dim+1)
                 
-            self.clover_R[adapter_name].data = R.to(dtype).contiguous()
+            self.clover_S[adapter_name].data = S.reshape(-1).to(dtype).contiguous()
+            self.clover_V[adapter_name].data = V.to(dtype).contiguous()
             if self.base_layer.bias is not None:
-                self.base_layer.bias.data = Q[:,:,-1].reshape(-1).to(dtype).contiguous()
-                Q = Q[:,:,:-1] # (num_heads, head_dim, in_dim)
-            self.base_layer.weight.data = Q.reshape(-1, self.in_features).to(dtype).contiguous()
+                self.base_layer.bias.data = U[:,:,-1].reshape(-1).to(dtype).contiguous()
+                U = U[:,:,:-1] # (num_heads, head_dim, in_dim)
+            self.base_layer.weight.data = U.reshape(-1, self.in_features).to(dtype).contiguous()
     
     def merge(self, safe_merge: bool = True, adapter_names: Optional[list[str]] = None) -> None:
         """
@@ -177,19 +185,22 @@ class Linear(nn.Module, CloverLayer):
             return
 
         for active_adapter in adapter_names:
-            if active_adapter in self.clover_R.keys():
+            if active_adapter in self.clover_V.keys():
                 base_layer = self.get_base_layer()
                 # Note that safe_merge will be slower than the normal merge
                 # because of the copy operation.
                 base_weights = base_layer.weight.data.clone() # (out_dim, in_dim)
-                weight_R = self.clover_R[active_adapter].data #(num_head, head_dim, head_dim) or (head_dim, num_head, num_head)
+                weight_S = self.clover_S[active_adapter].data #(num_head*head_dim)
+                weight_V = self.clover_V[active_adapter].data #(num_head, head_dim, head_dim) or (head_dim, num_head, num_head)
                 if self.decomp[active_adapter]:
                     if self.cross_head[active_adapter]:
                         base_weights = base_weights.view(self.out_features, self.num_head[active_adapter], -1)
-                        base_weights = torch.einsum("ohd,dlh->old", base_weights, weight_R) 
+                        weight_S = weight_S.view(self.num_head[active_adapter], -1)
+                        base_weights = torch.einsum("ohd,hd,dlh->old", base_weights, weight_S, weight_V) 
                     else:
                         base_weights = base_weights.view(self.out_features, -1, self.head_dim[active_adapter])
-                        base_weights = torch.einsum("ohd,hed->ohe", base_weights, weight_R) 
+                        weight_S =  weight_S.view(-1, self.head_dim[active_adapter])
+                        base_weights = torch.einsum("ohd,hd,hed->ohe", base_weights, weight_S, weight_V) 
                 else:
                     if base_layer.bias is not None:
                         base_bias = base_layer.bias.data.clone().unsqueeze(1) # (out_dim, 1)
@@ -200,10 +211,12 @@ class Linear(nn.Module, CloverLayer):
                         
                     if self.cross_head[active_adapter]:
                         base_weights = base_weights.view(self.num_head[active_adapter], -1, in_features)
-                        base_weights = torch.einsum("hdi,dhl->ldi", base_weights, weight_R)
+                        weight_S =  weight_S.view(self.num_head[active_adapter], -1)
+                        base_weights = torch.einsum("hdi,hd,dhl->ldi", base_weights, weight_S, weight_V) 
                     else:
                         base_weights = base_weights.view(-1, self.head_dim[active_adapter], in_features)
-                        base_weights = torch.einsum("hdi,hde->hei", base_weights, weight_R)
+                        weight_S =  weight_S.view(-1, self.head_dim[active_adapter])
+                        base_weights = torch.einsum("hdi,hd,hde->hei", base_weights, weight_S, weight_V) 
                 base_weights = base_weights.reshape(self.out_features, -1).contiguous()
                 if not torch.isfinite(base_weights).all():
                     raise ValueError(
@@ -216,14 +229,14 @@ class Linear(nn.Module, CloverLayer):
 
                 self.merged_adapters.append(active_adapter)
 
-    def rotation(self, result, clover_R, num_head, head_dim, cross_head=False):
+    def rotation(self, result, clover_V, num_head, head_dim, cross_head=False):
         bsz, seq, _ = result.shape
         if cross_head:
             result = result.view(bsz, seq, num_head, -1)
-            result = torch.einsum("bshd,dhi->bsid", result, clover_R)
+            result = torch.einsum("bshd,dhi->bsid", result, clover_V)
         else:
             result = result.view(bsz, seq, -1, head_dim)
-            result = torch.einsum("bshd,hde->bshe", result, clover_R)
+            result = torch.einsum("bshd,hde->bshe", result, clover_V)
         result = result.reshape(bsz, seq, -1).contiguous() 
         return result
 
@@ -242,22 +255,26 @@ class Linear(nn.Module, CloverLayer):
         else:
             torch_x_dtype = x.dtype
             for active_adapter in self.active_adapters:
-                if active_adapter not in self.clover_R.keys():
+                if active_adapter not in self.clover_V.keys():
                     continue
                 if not self.decomp[active_adapter]:
                     continue
-                clover_R = self.clover_R[active_adapter]
-                x = self.rotation(x, clover_R, self.num_head[active_adapter], self.head_dim[active_adapter], self.cross_head[active_adapter])
+                clover_S = self.clover_S[active_adapter]
+                clover_V = self.clover_V[active_adapter]
+                x = self.rotation(x, clover_V, self.num_head[active_adapter], self.head_dim[active_adapter], self.cross_head[active_adapter])
+                x *= clover_S
             x = x.to(torch_x_dtype)
             result = self.base_layer(x, *args, **kwargs) # (bsz, seq, num_heads*head_dim)
             torch_result_dtype = result.dtype
             for active_adapter in self.active_adapters:
-                if active_adapter not in self.clover_R.keys():
+                if active_adapter not in self.clover_V.keys():
                     continue
                 if self.decomp[active_adapter]:
                     continue
-                clover_R = self.clover_R[active_adapter]
-                result = self.rotation(result, clover_R, self.num_head[active_adapter], self.head_dim[active_adapter], self.cross_head[active_adapter])
+                clover_S = self.clover_S[active_adapter]
+                clover_V = self.clover_V[active_adapter]
+                result *= clover_S
+                result = self.rotation(result, clover_V, self.num_head[active_adapter], self.head_dim[active_adapter], self.cross_head[active_adapter])
             result = result.to(torch_result_dtype)
 
         return result
@@ -276,17 +293,19 @@ class Linear(nn.Module, CloverLayer):
         for i, active_adapter in enumerate(unique_adapters):
             if active_adapter == "__base__":
                 continue
-            if active_adapter not in self.clover_R.keys():
+            if active_adapter not in self.clover_V.keys():
                 continue
             if not self.decomp[active_adapter]:
                     continue
-            clover_R = self.clover_R[active_adapter]
+            clover_S = self.clover_S[active_adapter]
+            clover_V = self.clover_V[active_adapter]
             torch_x_dtype = x.dtype
 
             # getting the sub-batch, passing it to CLOVER layers and updating the corresponding indices of the linear
             # layer output
-            sub_batch = x[sub_batch_indices_list[i]].to(clover_R.dtype)
-            clover_x = self.rotation(sub_batch, clover_R, self.num_head[active_adapter], self.head_dim[active_adapter], self.cross_head[active_adapter])
+            sub_batch = x[sub_batch_indices_list[i]].to(clover_V.dtype)
+            clover_x = self.rotation(sub_batch, clover_V, self.num_head[active_adapter], self.head_dim[active_adapter], self.cross_head[active_adapter])
+            clover_x *= clover_S
             x[sub_batch_indices_list[i]] = clover_x.to(torch_x_dtype)
             
         result = self.base_layer(x, *args, **kwargs)
@@ -295,18 +314,20 @@ class Linear(nn.Module, CloverLayer):
         for i, active_adapter in enumerate(unique_adapters):
             if active_adapter == "__base__":
                 continue
-            if active_adapter not in self.clover_R.keys():
+            if active_adapter not in self.clover_V.keys():
                 continue
             if self.decomp[active_adapter]:
                     continue
-            clover_R = self.clover_R[active_adapter]
+            clover_S = self.clover_S[active_adapter]
+            clover_V = self.clover_V[active_adapter]
 
             # getting the sub-batch, passing it to CLOVER layers and updating the corresponding indices of the linear
             # layer output
-            sub_batch = result[sub_batch_indices_list[i]].to(clover_R.dtype)
+            sub_batch = result[sub_batch_indices_list[i]].to(clover_V.dtype)
             if self.decomp[active_adapter]:
                     continue
-            clover_output = self.rotation(sub_batch, clover_R, self.num_head[active_adapter], self.head_dim[active_adapter], self.cross_head[active_adapter])
+            sub_batch *= clover_S
+            clover_output = self.rotation(sub_batch, clover_V, self.num_head[active_adapter], self.head_dim[active_adapter], self.cross_head[active_adapter])
             result[sub_batch_indices_list[i]] = clover_output.to(torch_result_dtype)
 
         return result

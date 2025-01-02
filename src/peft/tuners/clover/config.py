@@ -108,19 +108,14 @@ class CloverConfig(PeftConfig):
         },
     )
     init_clover_weights: (
-        bool | Literal["gaussian", "eva", "oclover", "pissa", "pissa_niter_[number of iters]", "loftq"]
+        bool | Literal["eye", "svd"]
     ) = field(
         default=True,
         metadata={
             "help": (
-                "How to initialize the weights of the CLOVER layers. Passing `'True'` (default) results in the default "
-                "initialization from the reference implementation from Microsoft. Passing `'gaussian'` results "
-                "in Gaussian initialization scaled by the CLOVER rank for linear and layers. Setting the initialization "
-                "to `'False'` leads to completely random initialization and *is discouraged.*"
-                "Pass `'eva'` results in a data-driven initialization of Explained Variance Adaptation."
-                "Passing `'oclover'` results in OCLOVER initialization."
-                "Passing `'pissa'` results in PiSSA initialization."
-                "Passing `'pissa_niter_[number of iters]'` initiates Fast-SVD-based PiSSA initialization, "
+                "How to initialize the weights of the CLOVER layers. "
+                "Passing `'eye'` results in OCLOVER initialization."
+                "Passing `'svd'` initiates Fast-SVD-based PiSSA initialization, "
                 "where [number of iters] indicates the number of subspace iterations to perform fsvd, and must be a nonnegative integer."
                 "Pass `'loftq'` to use LoftQ initialization"
             ),
