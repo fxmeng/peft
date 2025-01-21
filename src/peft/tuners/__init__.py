@@ -28,6 +28,7 @@ from .lora import (
     initialize_lora_eva_weights,
 )
 from .clover import CloverConfig, CloverModel
+from .crossover import CrossoverConfig, CrossoverModel
 from .loha import LoHaConfig, LoHaModel
 from .lokr import LoKrConfig, LoKrModel
 from .ia3 import IA3Config, IA3Model

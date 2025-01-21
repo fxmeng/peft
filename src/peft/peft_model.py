@@ -56,6 +56,7 @@ from .tuners import (
     LoKrModel,
     LoraModel,
     CloverModel,
+    CrossoverModel,
     MultitaskPromptEmbedding,
     OFTModel,
     PolyModel,
@@ -91,6 +92,7 @@ from .utils import (
 PEFT_TYPE_TO_MODEL_MAPPING = {
     PeftType.LORA: LoraModel,
     PeftType.CLOVER: CloverModel,
+    PeftType.CROSSOVER: CrossoverModel,
     PeftType.LOHA: LoHaModel,
     PeftType.LOKR: LoKrModel,
     PeftType.PROMPT_TUNING: PromptEmbedding,

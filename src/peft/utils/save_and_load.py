@@ -136,6 +136,9 @@ def get_peft_model_state_dict(
     elif config.peft_type == PeftType.CLOVER:
         to_return = {k: state_dict[k] for k in state_dict if "clover_" in k}
         
+    elif config.peft_type == PeftType.CROSSOVER:
+        to_return = {k: state_dict[k] for k in state_dict if "crossover_" in k}
+        
     elif config.peft_type == PeftType.LOHA:
         to_return = {k: state_dict[k] for k in state_dict if "hada_" in k}
 
@@ -437,6 +440,10 @@ def set_peft_model_state_dict(
     elif config.is_prompt_learning or config.peft_type == PeftType.ADAPTION_PROMPT:
         peft_model_state_dict = state_dict
     elif config.peft_type == PeftType.XLORA:
+        peft_model_state_dict = state_dict
+    elif config.peft_type == PeftType.CLOVER:
+        peft_model_state_dict = state_dict
+    elif config.peft_type == PeftType.CROSSOVER:
         peft_model_state_dict = state_dict
     else:
         raise NotImplementedError

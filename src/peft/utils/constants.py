@@ -302,6 +302,7 @@ PEFT_TYPE_TO_PREFIX_MAPPING = {
     PeftType.IA3: "ia3_",
     PeftType.LORA: "lora_",
     PeftType.CLOVER: "clover_",
+    PeftType.CROSSOVER: "crossover_",
     PeftType.ADALORA: "lora_",
     PeftType.LOHA: "hada_",
     PeftType.LOKR: "lokr_",
