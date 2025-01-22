@@ -72,12 +72,14 @@ class CrossoverConfig(PeftConfig):
         },
     )
     block_size: Optional[int] = field(
-        default=None,
+        default=64,
         metadata={
             "help": (
             ),
         },
     )
+    alpha: int = field(default=64, metadata={"help": "Crossover alpha"})
+    dropout: float = field(default=0.0, metadata={"help": "Crossover dropout"})
     exclude_modules: Optional[Union[list[str], str]] = field(
         default=None,
         metadata={"help": "List of module names or regex expression of the module names to exclude from Crossover."},

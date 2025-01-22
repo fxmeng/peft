@@ -172,6 +172,8 @@ class CrossoverModel(BaseTuner):
             raise ValueError("Current Key shouldn't be `None`")
         kwargs = {
             "block_size": crossover_config.block_size,
+            "alpha": crossover_config.alpha,
+            "dropout": crossover_config.dropout,
             "init_crossover_weights": crossover_config.init_crossover_weights,
             "loaded_in_8bit": getattr(self.model, "is_loaded_in_8bit", False),
             "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
@@ -181,6 +183,8 @@ class CrossoverModel(BaseTuner):
             target.update_layer(
                 adapter_name,
                 crossover_config.block_size,
+                crossover_config.alpha,
+                crossover_config.dropout,
                 init_crossover_weights=crossover_config.init_crossover_weights,
             )
         else:

@@ -26,6 +26,9 @@ class CrossoverLayer(BaseTunerLayer):
     def __init__(self, base_layer: nn.Module, **kwargs) -> None:
         self.base_layer = base_layer
         self.block_size = {}
+        self.alpha = {}
+        self.scaling = {}
+        self.dropout = nn.ModuleDict({})
         self.crossover_A = nn.ParameterDict({})
         self.crossover_B = nn.ParameterDict({})
         # Mark the weight as unmerged
@@ -66,6 +69,8 @@ class Linear(nn.Module, CrossoverLayer):
         base_layer,
         adapter_name: str = 'default',
         block_size: int = 64,
+        alpha: int = 64,
+        dropout: float = 0.0,
         init_crossover_weights: str = 'kaiming', # Choices: ['kaiming', 'gaussian', 'orthogonal']
         **kwargs,
     ) -> None:
@@ -75,37 +80,79 @@ class Linear(nn.Module, CrossoverLayer):
         self.update_layer(
             adapter_name,
             block_size,
+            alpha,
+            dropout,
             init_crossover_weights=init_crossover_weights,
         )
 
     def update_layer(
-        self, adapter_name, block_size, init_crossover_weights
+        self, adapter_name, block_size, alpha, dropout, init_crossover_weights
     ):
-        # Actual trainable parameters
         self.block_size[adapter_name] = block_size
+        self.alpha[adapter_name] = alpha
+        if dropout > 0.0:
+            dropout_layer = nn.Dropout(p=dropout)
+        else:
+            dropout_layer = nn.Identity()
+
+        self.dropout.update(nn.ModuleDict({adapter_name: dropout_layer}))
+        self.scaling[adapter_name] = alpha / block_size
+        
+        # Actual trainable parameters
         self.crossover_A[adapter_name] = nn.Parameter(torch.randn(block_size, self.in_features//block_size, self.out_features//block_size))
         self.crossover_B[adapter_name] = nn.Parameter(torch.randn((self.out_features//block_size, block_size, block_size)))
 
         # for inits that require access to the base weight, use gather_param_ctx so that the weight is gathered when using DeepSpeed
-        if init_crossover_weights == 'orthogonal':
-            self.orthonormal_init(adapter_name)
-        else:
+        if init_crossover_weights == 'kaiming':
             self.kaiming_init(adapter_name)
+        elif init_crossover_weights == 'gaussian':
+            self.gaussian_init(adapter_name)
+        elif init_crossover_weights == 'orthogonal':
+            self.orthogonal_init(adapter_name)
+        else:
+            raise ValueError
 
         self.set_adapter(self.active_adapters)
 
     def kaiming_init(self, adapter_name):
-        if adapter_name in self.crossover_A.keys():
-            nn.init.kaiming_uniform_(self.crossover_B[adapter_name], a=math.sqrt(5))
-            nn.init.zeros_(self.crossover_B[adapter_name])
+        nn.init.kaiming_uniform_(self.crossover_B[adapter_name], a=math.sqrt(5))
+        nn.init.zeros_(self.crossover_B[adapter_name])
             
     def gaussian_init(self, adapter_name):
-        if adapter_name in self.crossover_A.keys():
-            nn.init.normal_(self.crossover_A[adapter_name], std=1 / self.block_size[adapter_name])
-            nn.init.zeros_(self.crossover_B[adapter_name])
+        nn.init.normal_(self.crossover_A[adapter_name], std=1 / self.block_size[adapter_name])
+        nn.init.zeros_(self.crossover_B[adapter_name])
             
     def orthogonal_init(self, adapter_name):
-        raise NotImplementedError
+        Ua,_,Va = torch.linalg.svd(self.crossover_A[adapter_name],full_matrices=False)
+        if self.in_features > self.out_features:
+            self.crossover_A[adapter_name].data = Ua
+        else:
+            self.crossover_A[adapter_name].data = Va
+        Ub,_,_ = torch.linalg.svd(self.crossover_B[adapter_name],full_matrices=False)
+        self.crossover_B[adapter_name].data = Ub
+        base_layer = self.get_base_layer()
+        base_layer.weight.data -= self.get_delta_weight(adapter_name)
+        
+        
+    def get_delta_weight(self, adapter_name):
+        weight_A = self.crossover_A[adapter_name].data
+        full_A = torch.zeros(self.in_features, self.out_features, device=weight_A.device)
+        full_A = full_A.reshape(self.block_size[adapter_name], self.in_features//self.block_size[adapter_name], self.block_size[adapter_name], self.out_features//self.block_size[adapter_name])
+        for i in range(self.block_size[adapter_name]):
+            full_A[i,:,i,:]=weight_A[i]
+        full_A = full_A.permute(1,0,3,2).reshape(self.in_features, self.out_features)
+        weight_B = self.crossover_B[adapter_name].data
+        full_B = torch.zeros(self.out_features, self.out_features, device=weight_A.device)
+        full_B = full_B.reshape(self.out_features//self.block_size[adapter_name], self.block_size[adapter_name], self.out_features//self.block_size[adapter_name], self.block_size[adapter_name])
+        for i in range(self.out_features//self.block_size[adapter_name]):
+            full_B[i,:,i,:]=weight_B[i]
+        full_B = full_B.reshape(self.out_features, self.out_features)
+        crossover_weight = (full_A @ full_B).T * self.scaling[adapter_name]
+        if not torch.isfinite(crossover_weight).all():
+            raise ValueError(
+                f"NaNs detected in the merged weights. The adapter {adapter_name} seems to be broken"
+            )
+        return crossover_weight
     
     def merge(self, safe_merge: bool = True, adapter_names: Optional[list[str]] = None) -> None:
         """
@@ -128,28 +175,7 @@ class Linear(nn.Module, CrossoverLayer):
         for active_adapter in adapter_names:
             if active_adapter in self.crossover_A.keys():
                 base_layer = self.get_base_layer()
-                # Note that safe_merge will be slower than the normal merge
-                # because of the copy operation.
-                base_weights = base_layer.weight.data.clone() # (out_dim, in_dim)
-                weight_A = self.crossover_A[active_adapter].data
-                full_A = torch.zeros(self.in_features, self.out_features)
-                full_A = full_A.reshape(self.block_size[active_adapter], self.in_features//self.block_size[active_adapter], self.block_size[active_adapter], self.out_features//self.block_size[active_adapter])
-                for i in range(self.block_size[active_adapter]):
-                    full_A[i,:,i,:]=weight_A[i]
-                full_A = full_A.permute(1,0,3,2).reshape(self.in_features, self.out_features)
-                weight_B = self.crossover_B[active_adapter].data
-                full_B = torch.zeros(self.out_features, self.out_features)
-                full_B = full_B.reshape(self.out_features//self.block_size[active_adapter], self.block_size[active_adapter], self.out_features//self.block_size[active_adapter], self.block_size[active_adapter])
-                for i in range(self.out_features//self.block_size[active_adapter]):
-                    full_B[i,:,i,:]=weight_B[i]
-                full_B = full_B.reshape(self.out_features, self.out_features)
-                crossover_weight = full_A @ full_B
-                if not torch.isfinite(base_weights).all():
-                    raise ValueError(
-                        f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
-                    )
-                base_layer.weight.data = base_weights + crossover_weight.T
-
+                base_layer.weight.data += self.get_delta_weight(active_adapter)
                 self.merged_adapters.append(active_adapter)
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
@@ -168,9 +194,11 @@ class Linear(nn.Module, CrossoverLayer):
                 crossover_A = self.crossover_A[active_adapter]
                 x = x.reshape(torch_result_shape[0], torch_result_shape[1], crossover_A.shape[1], self.in_features//crossover_A.shape[1])
                 x = torch.einsum("bnid,dio->bnod", x, crossover_A)
+                x = self.dropout[active_adapter](x)
                 crossover_B = self.crossover_B[active_adapter]
                 x = torch.einsum("bnod,ode->bnoe", x, crossover_B)
-                result += x.reshape(torch_result_shape[0], torch_result_shape[1], self.out_features)
+                scaling = self.scaling[active_adapter]
+                result += scaling * x.reshape(torch_result_shape[0], torch_result_shape[1], self.out_features)
             result = result.to(torch_result_dtype)
         return result
 
