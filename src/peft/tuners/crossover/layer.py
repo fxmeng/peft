@@ -96,7 +96,7 @@ class Linear(nn.Module, CrossoverLayer):
             dropout_layer = nn.Identity()
 
         self.dropout.update(nn.ModuleDict({adapter_name: dropout_layer}))
-        self.scaling[adapter_name] = alpha / block_size
+        self.scaling[adapter_name] = alpha / math.sqrt(block_size)
         
         # Actual trainable parameters
         self.crossover_A[adapter_name] = nn.Parameter(torch.randn(block_size, self.in_features//block_size, self.out_features//block_size))
