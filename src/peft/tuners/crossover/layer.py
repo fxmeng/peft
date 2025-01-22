@@ -125,13 +125,13 @@ class Linear(nn.Module, CrossoverLayer):
     def orthogonal_init(self, adapter_name):
         Ua,_,Va = torch.linalg.svd(self.crossover_A[adapter_name],full_matrices=False)
         if self.in_features > self.out_features:
-            self.crossover_A[adapter_name].data = Ua
+            self.crossover_A[adapter_name].data = Ua.contiguous()
         else:
-            self.crossover_A[adapter_name].data = Va
+            self.crossover_A[adapter_name].data = Va.contiguous()
         Ub,_,_ = torch.linalg.svd(self.crossover_B[adapter_name],full_matrices=False)
-        self.crossover_B[adapter_name].data = Ub
+        self.crossover_B[adapter_name].data = Ub.contiguous()
         base_layer = self.get_base_layer()
-        base_layer.weight.data -= self.get_delta_weight(adapter_name)
+        base_layer.weight.data -= self.get_delta_weight(adapter_name).to(base_layer.weight.dtype).to(base_layer.weight.device)
         
         
     def get_delta_weight(self, adapter_name):
@@ -152,7 +152,7 @@ class Linear(nn.Module, CrossoverLayer):
             raise ValueError(
                 f"NaNs detected in the merged weights. The adapter {adapter_name} seems to be broken"
             )
-        return crossover_weight
+        return crossover_weight.contiguous()
     
     def merge(self, safe_merge: bool = True, adapter_names: Optional[list[str]] = None) -> None:
         """
@@ -175,7 +175,7 @@ class Linear(nn.Module, CrossoverLayer):
         for active_adapter in adapter_names:
             if active_adapter in self.crossover_A.keys():
                 base_layer = self.get_base_layer()
-                base_layer.weight.data += self.get_delta_weight(active_adapter)
+                base_layer.weight.data += self.get_delta_weight(active_adapter).to(base_layer.weight.dtype).to(base_layer.weight.device)
                 self.merged_adapters.append(active_adapter)
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
