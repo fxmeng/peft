@@ -21,7 +21,7 @@ from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 
 class CrossoverLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
-    adapter_layer_names = ("crossover_A", "crossover_B")
+    adapter_layer_names = ("crossover_U", "crossover_S", "crossover_V")
 
     def __init__(self, base_layer: nn.Module, **kwargs) -> None:
         self.base_layer = base_layer
@@ -29,8 +29,9 @@ class CrossoverLayer(BaseTunerLayer):
         self.alpha = {}
         self.scaling = {}
         self.dropout = nn.ModuleDict({})
-        self.crossover_A = nn.ParameterDict({})
-        self.crossover_B = nn.ParameterDict({})
+        self.crossover_U = nn.ParameterDict({})
+        self.crossover_S = nn.ParameterDict({})
+        self.crossover_V = nn.ParameterDict({})
         # Mark the weight as unmerged
         self._disable_adapters = False
         self.merged_adapters = []
@@ -96,11 +97,11 @@ class Linear(nn.Module, CrossoverLayer):
             dropout_layer = nn.Identity()
 
         self.dropout.update(nn.ModuleDict({adapter_name: dropout_layer}))
-        self.scaling[adapter_name] = alpha / math.sqrt(block_size)
-        
+        self.scaling[adapter_name] = alpha / block_size
         # Actual trainable parameters
-        self.crossover_A[adapter_name] = nn.Parameter(torch.randn(block_size, self.in_features//block_size, self.out_features//block_size))
-        self.crossover_B[adapter_name] = nn.Parameter(torch.randn((self.out_features//block_size, block_size, block_size)))
+        self.crossover_U[adapter_name] = nn.Parameter(torch.randn(block_size, self.in_features//block_size, self.out_features//block_size))
+        self.crossover_S[adapter_name] = nn.Parameter(torch.ones(1))
+        self.crossover_V[adapter_name] = nn.Parameter(torch.randn((self.out_features//block_size, block_size, block_size)))
 
         # for inits that require access to the base weight, use gather_param_ctx so that the weight is gathered when using DeepSpeed
         if init_crossover_weights == 'kaiming':
@@ -115,39 +116,41 @@ class Linear(nn.Module, CrossoverLayer):
         self.set_adapter(self.active_adapters)
 
     def kaiming_init(self, adapter_name):
-        nn.init.kaiming_uniform_(self.crossover_B[adapter_name], a=math.sqrt(5))
-        nn.init.zeros_(self.crossover_B[adapter_name])
+        nn.init.kaiming_uniform_(self.crossover_V[adapter_name], a=math.sqrt(5))
+        nn.init.zeros_(self.crossover_V[adapter_name])
             
     def gaussian_init(self, adapter_name):
-        nn.init.normal_(self.crossover_A[adapter_name], std=1 / self.block_size[adapter_name])
-        nn.init.zeros_(self.crossover_B[adapter_name])
+        nn.init.normal_(self.crossover_U[adapter_name], std=1 / self.block_size[adapter_name])
+        nn.init.zeros_(self.crossover_V[adapter_name])
             
     def orthogonal_init(self, adapter_name):
-        Ua,_,Va = torch.linalg.svd(self.crossover_A[adapter_name],full_matrices=False)
+        Ua,_,Va = torch.linalg.svd(self.crossover_U[adapter_name],full_matrices=False)
         if self.in_features > self.out_features:
-            self.crossover_A[adapter_name].data = Ua.contiguous()
+            self.crossover_U[adapter_name].data = Ua.contiguous()
         else:
-            self.crossover_A[adapter_name].data = Va.contiguous()
-        Ub,_,_ = torch.linalg.svd(self.crossover_B[adapter_name],full_matrices=False)
-        self.crossover_B[adapter_name].data = Ub.contiguous()
+            self.crossover_U[adapter_name].data = Va.contiguous()
+        Ub,_,_ = torch.linalg.svd(self.crossover_V[adapter_name],full_matrices=False)
+        self.crossover_V[adapter_name].data = Ub.contiguous()
         base_layer = self.get_base_layer()
-        base_layer.weight.data -= self.get_delta_weight(adapter_name).to(base_layer.weight.dtype).to(base_layer.weight.device)
-        
+        self.crossover_S[adapter_name].data[0] = torch.linalg.norm(base_layer.weight.data, ord=2)
+        crossover_weight = self.get_delta_weight(adapter_name)
+        print(self.crossover_S[adapter_name].data[0].item())
+        base_layer.weight.data -= self.scaling[adapter_name] * crossover_weight.to(base_layer.weight.dtype).to(base_layer.weight.device)
         
     def get_delta_weight(self, adapter_name):
-        weight_A = self.crossover_A[adapter_name].data
-        full_A = torch.zeros(self.in_features, self.out_features, device=weight_A.device)
-        full_A = full_A.reshape(self.block_size[adapter_name], self.in_features//self.block_size[adapter_name], self.block_size[adapter_name], self.out_features//self.block_size[adapter_name])
+        weight_U = self.crossover_U[adapter_name].data
+        full_U = torch.zeros(self.in_features, self.out_features, device=weight_U.device)
+        full_U = full_U.reshape(self.block_size[adapter_name], self.in_features//self.block_size[adapter_name], self.block_size[adapter_name], self.out_features//self.block_size[adapter_name])
         for i in range(self.block_size[adapter_name]):
-            full_A[i,:,i,:]=weight_A[i]
-        full_A = full_A.permute(1,0,3,2).reshape(self.in_features, self.out_features)
-        weight_B = self.crossover_B[adapter_name].data
-        full_B = torch.zeros(self.out_features, self.out_features, device=weight_A.device)
-        full_B = full_B.reshape(self.out_features//self.block_size[adapter_name], self.block_size[adapter_name], self.out_features//self.block_size[adapter_name], self.block_size[adapter_name])
+            full_U[i,:,i,:]=weight_U[i]
+        full_U = full_U.permute(1,0,3,2).reshape(self.in_features, self.out_features)
+        weight_V = self.crossover_V[adapter_name].data
+        full_V = torch.zeros(self.out_features, self.out_features, device=weight_U.device)
+        full_V = full_V.reshape(self.out_features//self.block_size[adapter_name], self.block_size[adapter_name], self.out_features//self.block_size[adapter_name], self.block_size[adapter_name])
         for i in range(self.out_features//self.block_size[adapter_name]):
-            full_B[i,:,i,:]=weight_B[i]
-        full_B = full_B.reshape(self.out_features, self.out_features)
-        crossover_weight = (full_A @ full_B).T * self.scaling[adapter_name]
+            full_V[i,:,i,:]=weight_V[i]
+        full_V = full_V.reshape(self.out_features, self.out_features)
+        crossover_weight = (full_U @ full_V).T * self.scaling[adapter_name] * self.crossover_S[adapter_name].data[0]
         if not torch.isfinite(crossover_weight).all():
             raise ValueError(
                 f"NaNs detected in the merged weights. The adapter {adapter_name} seems to be broken"
@@ -173,7 +176,7 @@ class Linear(nn.Module, CrossoverLayer):
             return
 
         for active_adapter in adapter_names:
-            if active_adapter in self.crossover_A.keys():
+            if active_adapter in self.crossover_U.keys():
                 base_layer = self.get_base_layer()
                 base_layer.weight.data += self.get_delta_weight(active_adapter).to(base_layer.weight.dtype).to(base_layer.weight.device)
                 self.merged_adapters.append(active_adapter)
@@ -191,13 +194,13 @@ class Linear(nn.Module, CrossoverLayer):
             torch_result_dtype = result.dtype
             torch_result_shape = result.shape
             for active_adapter in self.active_adapters:
-                crossover_A = self.crossover_A[active_adapter]
-                x = x.reshape(torch_result_shape[0], torch_result_shape[1], crossover_A.shape[1], self.in_features//crossover_A.shape[1])
-                x = torch.einsum("bnid,dio->bnod", x, crossover_A)
+                crossover_U = self.crossover_U[active_adapter]
+                x = x.reshape(torch_result_shape[0], torch_result_shape[1], crossover_U.shape[1], self.in_features//crossover_U.shape[1])
+                x = torch.einsum("bnid,dio->bnod", x, crossover_U)
                 x = self.dropout[active_adapter](x)
-                crossover_B = self.crossover_B[active_adapter]
-                x = torch.einsum("bnod,ode->bnoe", x, crossover_B)
-                scaling = self.scaling[active_adapter]
+                crossover_V = self.crossover_V[active_adapter]
+                x = torch.einsum("bnod,ode->bnoe", x, crossover_V)
+                scaling = self.scaling[active_adapter] * self.crossover_S[active_adapter][0]
                 result += scaling * x.reshape(torch_result_shape[0], torch_result_shape[1], self.out_features)
             result = result.to(torch_result_dtype)
         return result
